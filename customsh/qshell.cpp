@@ -1,6 +1,5 @@
 // ============================================================================
-// Q-SHELL LAUNCHER v2.5 - COMPLETE FIXED VERSION
-// Features: Fixed Task Switcher, Global Hotkeys (Tab+O / Share+X), Pro Design
+// Q-SHELL LAUNCHER v2.6 - WITH SOUND, PROFILE & THEMES
 // ============================================================================
 
 #define WIN32_LEAN_AND_MEAN
@@ -27,7 +26,6 @@
 #include <commdlg.h>
 #include <urlmon.h>
 
-// Windows API cursor function wrapper (must be before #undef)
 inline int WindowsShowCursor(BOOL bShow) {
     typedef int (WINAPI *ShowCursorFn)(BOOL);
     static ShowCursorFn fn = (ShowCursorFn)GetProcAddress(GetModuleHandleA("user32.dll"), "ShowCursor");
@@ -58,6 +56,7 @@ inline int WindowsShowCursor(BOOL bShow) {
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <map>
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
@@ -68,7 +67,7 @@ inline int WindowsShowCursor(BOOL bShow) {
 namespace fs = std::filesystem;
 
 // ============================================================================
-// XINPUT DYNAMIC LOADING (Fixes missing xinput1_3.dll)
+// XINPUT DYNAMIC LOADING
 // ============================================================================
 
 typedef DWORD (WINAPI *PFN_XInputGetState)(DWORD, void*);
@@ -108,28 +107,17 @@ struct XINPUT_STATE_STRUCT {
 
 void LoadXInput() {
     if (g_XInputLoaded) return;
-    
-    const char* dllNames[] = {
-        "xinput1_4.dll",
-        "xinput1_3.dll", 
-        "xinput9_1_0.dll",
-        "xinput1_2.dll",
-        "xinput1_1.dll"
-    };
-    
+    const char* dllNames[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll" };
     for (const char* dll : dllNames) {
         g_XInputLib = LoadLibraryA(dll);
         if (g_XInputLib) {
             g_XInputGetState = (PFN_XInputGetState)GetProcAddress(g_XInputLib, "XInputGetState");
-            if (g_XInputGetState) {
-                g_XInputLoaded = true;
-                return;
-            }
+            if (g_XInputGetState) { g_XInputLoaded = true; return; }
             FreeLibrary(g_XInputLib);
             g_XInputLib = NULL;
         }
     }
-    g_XInputLoaded = true; // Mark as tried even if failed
+    g_XInputLoaded = true;
 }
 
 DWORD SafeXInputGetState(DWORD dwUserIndex, XINPUT_STATE_STRUCT* pState) {
@@ -138,11 +126,7 @@ DWORD SafeXInputGetState(DWORD dwUserIndex, XINPUT_STATE_STRUCT* pState) {
 }
 
 void UnloadXInput() {
-    if (g_XInputLib) {
-        FreeLibrary(g_XInputLib);
-        g_XInputLib = NULL;
-        g_XInputGetState = nullptr;
-    }
+    if (g_XInputLib) { FreeLibrary(g_XInputLib); g_XInputLib = NULL; g_XInputGetState = nullptr; }
 }
 
 // ============================================================================
@@ -156,48 +140,23 @@ HWND g_mainWindow = NULL;
 std::string g_exeDirectory = "";
 std::mutex g_downloadMutex;
 
-// Global Task Switcher Control
 std::atomic<bool> g_taskSwitcherRequested(false);
 std::atomic<bool> g_appRunning(true);
 std::thread g_inputMonitorThread;
 HHOOK g_keyboardHook = NULL;
 std::mutex g_inputMutex;
 
-// Debounce timing
 DWORD g_lastTaskSwitchTime = 0;
 const DWORD DEBOUNCE_TIME = 400;
 
-// UI Mode
-enum class UIMode { MAIN, TASK_SWITCHER, SHELL_MENU, POWER_MENU };
+enum class UIMode { MAIN, TASK_SWITCHER, SHELL_MENU, POWER_MENU, PROFILE_EDIT, THEME_SELECT };
 UIMode g_currentMode = UIMode::MAIN;
 std::mutex g_modeMutex;
 
-// Task Switcher State
 std::vector<struct RunningTask> g_tasks;
 int g_taskFocusIndex = 0;
 float g_taskSwitcherSlideIn = 0.0f;
 float g_taskSwitcherAnimTime = 0.0f;
-
-// ============================================================================
-// DEBUG LOGGING
-// ============================================================================
-
-void DebugLog(const std::string& message) {
-    static bool firstLog = true;
-    static std::mutex logMutex;
-    std::lock_guard<std::mutex> lock(logMutex);
-
-    std::string logPath = g_exeDirectory.empty() ? "qshell.log" : (g_exeDirectory + "\\qshell.log");
-    std::ofstream log(logPath, firstLog ? std::ios::trunc : std::ios::app);
-    firstLog = false;
-    if (log.is_open()) {
-        time_t now = time(nullptr);
-        char timeStr[64];
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        log << "[" << timeStr << "] " << message << "\n";
-        log.flush();
-    }
-}
 
 // ============================================================================
 // PATH MANAGEMENT
@@ -222,6 +181,357 @@ std::string GetFullPath(const std::string& relativePath) {
 }
 
 // ============================================================================
+// DEBUG LOGGING
+// ============================================================================
+
+void DebugLog(const std::string& message) {
+    static bool firstLog = true;
+    static std::mutex logMutex;
+    std::lock_guard<std::mutex> lock(logMutex);
+    std::string logPath = g_exeDirectory.empty() ? "qshell.log" : (g_exeDirectory + "\\qshell.log");
+    std::ofstream log(logPath, firstLog ? std::ios::trunc : std::ios::app);
+    firstLog = false;
+    if (log.is_open()) {
+        time_t now = time(nullptr);
+        char timeStr[64];
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        log << "[" << timeStr << "] " << message << "\n";
+        log.flush();
+    }
+}
+
+// ============================================================================
+// THEME SYSTEM
+// ============================================================================
+
+struct Theme {
+    std::string name;
+    Color primary;      // Main background
+    Color secondary;    // Secondary/darker areas
+    Color accent;       // Highlight color
+    Color accentAlt;    // Secondary accent
+    Color text;         // Main text
+    Color textDim;      // Dimmed text
+    Color cardBg;       // Card background
+    Color success;      // Green/success
+    Color warning;      // Yellow/warning
+    Color danger;       // Red/danger
+};
+
+std::vector<Theme> g_themes = {
+    {"Default Blue", {12, 12, 15, 255}, {20, 22, 28, 255}, {100, 149, 237, 255}, {65, 105, 225, 255}, 
+     WHITE, {150, 150, 150, 255}, {35, 35, 40, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"Xbox Green", {16, 16, 16, 255}, {24, 24, 24, 255}, {16, 124, 16, 255}, {50, 168, 82, 255},
+     WHITE, {140, 140, 140, 255}, {32, 32, 32, 255}, {16, 124, 16, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"PlayStation Blue", {0, 18, 51, 255}, {0, 30, 80, 255}, {0, 112, 224, 255}, {0, 68, 165, 255},
+     WHITE, {130, 150, 180, 255}, {0, 40, 100, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"Steam Dark", {23, 29, 37, 255}, {27, 40, 56, 255}, {102, 192, 244, 255}, {171, 216, 237, 255},
+     WHITE, {142, 152, 165, 255}, {42, 54, 69, 255}, {90, 200, 90, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"Nintendo Red", {28, 28, 28, 255}, {40, 40, 40, 255}, {230, 0, 18, 255}, {255, 70, 80, 255},
+     WHITE, {150, 150, 150, 255}, {50, 50, 50, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {230, 0, 18, 255}},
+    
+    {"Purple Haze", {18, 10, 28, 255}, {30, 18, 45, 255}, {138, 43, 226, 255}, {186, 85, 211, 255},
+     WHITE, {160, 140, 180, 255}, {45, 30, 60, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"Cyberpunk", {10, 5, 15, 255}, {20, 10, 30, 255}, {255, 0, 128, 255}, {0, 255, 255, 255},
+     WHITE, {180, 150, 200, 255}, {30, 15, 45, 255}, {0, 255, 128, 255}, {255, 255, 0, 255}, {255, 0, 64, 255}},
+    
+    {"Ocean", {10, 25, 35, 255}, {15, 40, 55, 255}, {0, 188, 212, 255}, {64, 224, 208, 255},
+     WHITE, {140, 170, 180, 255}, {20, 50, 70, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+    
+    {"Sunset", {30, 15, 15, 255}, {45, 25, 20, 255}, {255, 87, 51, 255}, {255, 165, 0, 255},
+     WHITE, {180, 150, 140, 255}, {55, 35, 30, 255}, {50, 205, 50, 255}, {255, 220, 100, 255}, {200, 40, 40, 255}},
+    
+    {"OLED Black", {0, 0, 0, 255}, {15, 15, 15, 255}, {255, 255, 255, 255}, {200, 200, 200, 255},
+     WHITE, {100, 100, 100, 255}, {20, 20, 20, 255}, {50, 205, 50, 255}, {255, 193, 7, 255}, {220, 53, 69, 255}},
+};
+
+int g_currentTheme = 0;
+Theme g_theme; // Active theme with smooth transitions
+Theme g_targetTheme;
+
+void SetTheme(int index) {
+    if (index >= 0 && index < (int)g_themes.size()) {
+        g_currentTheme = index;
+        g_targetTheme = g_themes[index];
+        DebugLog("Theme changed to: " + g_themes[index].name);
+    }
+}
+
+Color LerpColor(Color a, Color b, float t) {
+    return {
+        (unsigned char)(a.r + (b.r - a.r) * t),
+        (unsigned char)(a.g + (b.g - a.g) * t),
+        (unsigned char)(a.b + (b.b - a.b) * t),
+        (unsigned char)(a.a + (b.a - a.a) * t)
+    };
+}
+
+void UpdateThemeTransition(float speed = 0.08f) {
+    g_theme.primary = LerpColor(g_theme.primary, g_targetTheme.primary, speed);
+    g_theme.secondary = LerpColor(g_theme.secondary, g_targetTheme.secondary, speed);
+    g_theme.accent = LerpColor(g_theme.accent, g_targetTheme.accent, speed);
+    g_theme.accentAlt = LerpColor(g_theme.accentAlt, g_targetTheme.accentAlt, speed);
+    g_theme.text = LerpColor(g_theme.text, g_targetTheme.text, speed);
+    g_theme.textDim = LerpColor(g_theme.textDim, g_targetTheme.textDim, speed);
+    g_theme.cardBg = LerpColor(g_theme.cardBg, g_targetTheme.cardBg, speed);
+    g_theme.success = LerpColor(g_theme.success, g_targetTheme.success, speed);
+    g_theme.warning = LerpColor(g_theme.warning, g_targetTheme.warning, speed);
+    g_theme.danger = LerpColor(g_theme.danger, g_targetTheme.danger, speed);
+    g_theme.name = g_targetTheme.name;
+}
+
+// ============================================================================
+// AUDIO SYSTEM (FIXED)
+// ============================================================================
+
+// ============================================================================
+// AUDIO SYSTEM (FIXED - No naming conflicts)
+// ============================================================================
+
+#ifndef PI
+#define PI 3.14159265358979323846f
+#endif
+
+struct AudioSystem {
+    Sound sndMove;
+    Sound sndConfirm;
+    Sound sndBack;
+    Sound sndStartup;
+    Sound sndError;
+    Sound sndNotify;
+    Music bgMusic;
+    bool musicEnabled;
+    bool soundEnabled;
+    float masterVolume;
+    float musicVolume;
+    float sfxVolume;
+    bool initialized;
+    bool audioDeviceReady;
+    
+    AudioSystem() : musicEnabled(true), soundEnabled(true), masterVolume(0.8f), 
+                    musicVolume(0.3f), sfxVolume(0.7f), initialized(false), audioDeviceReady(false) {
+        sndMove = {0};
+        sndConfirm = {0};
+        sndBack = {0};
+        sndStartup = {0};
+        sndError = {0};
+        sndNotify = {0};
+        bgMusic = {0};
+    }
+};
+
+AudioSystem g_audio;
+
+// Renamed to avoid conflict with raylib's IsSoundValid
+bool IsSoundLoaded(Sound s) {
+    return s.frameCount > 0 && s.stream.sampleRate > 0;
+}
+
+// Generate a simple procedural beep sound as fallback
+Sound GenerateBeepSound(float frequency, float duration, float volume = 0.5f) {
+    int sampleRate = 44100;
+    int sampleCount = (int)(sampleRate * duration);
+    
+    if (sampleCount <= 0) return {0};
+    
+    float* samples = (float*)RL_MALLOC(sampleCount * sizeof(float));
+    if (!samples) {
+        DebugLog("ERROR: Failed to allocate memory for procedural sound");
+        return {0};
+    }
+    
+    for (int i = 0; i < sampleCount; i++) {
+        float t = (float)i / sampleRate;
+        float envelope = 1.0f;
+        float attackTime = 0.01f;
+        float releaseTime = 0.05f;
+        
+        if (t < attackTime) {
+            envelope = t / attackTime;
+        } else if (t > duration - releaseTime) {
+            envelope = (duration - t) / releaseTime;
+        }
+        
+        samples[i] = sinf(2.0f * PI * frequency * t) * volume * envelope;
+    }
+    
+    Wave wave = {0};
+    wave.frameCount = sampleCount;
+    wave.sampleRate = sampleRate;
+    wave.sampleSize = 32;
+    wave.channels = 1;
+    wave.data = samples;
+    
+    Sound sound = LoadSoundFromWave(wave);
+    UnloadWave(wave);
+    
+    if (IsSoundLoaded(sound)) {
+        DebugLog("Generated procedural sound: " + std::to_string((int)frequency) + "Hz");
+    }
+    
+    return sound;
+}
+
+Sound TryLoadSound(const std::string& basePath) {
+    const char* extensions[] = {".wav", ".ogg", ".mp3"};
+    for (const char* ext : extensions) {
+        std::string fullPath = GetFullPath(basePath + ext);
+        if (fs::exists(fullPath)) {
+            DebugLog("Attempting to load: " + fullPath);
+            Sound s = LoadSound(fullPath.c_str());
+            if (IsSoundLoaded(s)) {
+                DebugLog("Successfully loaded sound: " + fullPath);
+                return s;
+            } else {
+                DebugLog("WARNING: Sound file exists but failed to load: " + fullPath);
+            }
+        }
+    }
+    DebugLog("Sound file not found for: " + basePath);
+    return {0};
+}
+
+void InitAudioSystem() {
+    if (g_audio.initialized) return;
+    
+    DebugLog("=== Initializing Audio System ===");
+    
+    InitAudioDevice();
+    g_audio.audioDeviceReady = IsAudioDeviceReady();
+    
+    if (!g_audio.audioDeviceReady) {
+        DebugLog("CRITICAL ERROR: Audio device failed to initialize!");
+        g_audio.soundEnabled = false;
+        g_audio.musicEnabled = false;
+        g_audio.initialized = true;
+        return;
+    }
+    
+    DebugLog("Audio device initialized successfully");
+    
+    try {
+        fs::create_directories(GetFullPath("profile\\sounds"));
+    } catch (...) {}
+    
+    // Load sounds from files
+    g_audio.sndMove = TryLoadSound("profile\\sounds\\move");
+    g_audio.sndConfirm = TryLoadSound("profile\\sounds\\confirm");
+    g_audio.sndBack = TryLoadSound("profile\\sounds\\back");
+    g_audio.sndStartup = TryLoadSound("profile\\sounds\\startup");
+    g_audio.sndError = TryLoadSound("profile\\sounds\\error");
+    g_audio.sndNotify = TryLoadSound("profile\\sounds\\notify");
+    
+    // Generate fallback sounds for missing files
+    DebugLog("Generating fallback sounds for missing files...");
+    
+    if (!IsSoundLoaded(g_audio.sndMove)) {
+        g_audio.sndMove = GenerateBeepSound(880.0f, 0.04f, 0.25f);
+    }
+    if (!IsSoundLoaded(g_audio.sndConfirm)) {
+        g_audio.sndConfirm = GenerateBeepSound(1318.5f, 0.08f, 0.35f);
+    }
+    if (!IsSoundLoaded(g_audio.sndBack)) {
+        g_audio.sndBack = GenerateBeepSound(440.0f, 0.06f, 0.25f);
+    }
+    if (!IsSoundLoaded(g_audio.sndError)) {
+        g_audio.sndError = GenerateBeepSound(220.0f, 0.12f, 0.4f);
+    }
+    if (!IsSoundLoaded(g_audio.sndNotify)) {
+        g_audio.sndNotify = GenerateBeepSound(1046.5f, 0.1f, 0.3f);
+    }
+    
+    DebugLog("Sound status - Move:" + std::string(IsSoundLoaded(g_audio.sndMove) ? "OK" : "FAIL") +
+             " Confirm:" + std::string(IsSoundLoaded(g_audio.sndConfirm) ? "OK" : "FAIL") +
+             " Back:" + std::string(IsSoundLoaded(g_audio.sndBack) ? "OK" : "FAIL"));
+    
+    // Try to load background music
+    const char* musicPaths[] = {
+        "profile\\sounds\\ambient.ogg",
+        "profile\\sounds\\ambient.mp3",
+        "profile\\sounds\\music.ogg",
+        "profile\\sounds\\music.mp3"
+    };
+    
+    for (const char* path : musicPaths) {
+        std::string fullPath = GetFullPath(path);
+        if (fs::exists(fullPath)) {
+            g_audio.bgMusic = LoadMusicStream(fullPath.c_str());
+            if (g_audio.bgMusic.frameCount > 0) {
+                g_audio.bgMusic.looping = true;
+                DebugLog("Background music loaded: " + fullPath);
+                break;
+            }
+        }
+    }
+    
+    g_audio.initialized = true;
+    DebugLog("=== Audio System Ready ===");
+}
+
+void PlayUISound(Sound s) {
+    if (!g_audio.audioDeviceReady || !g_audio.soundEnabled || !IsSoundLoaded(s)) return;
+    SetSoundVolume(s, g_audio.sfxVolume * g_audio.masterVolume);
+    PlaySound(s);
+}
+
+void PlayMoveSound() { PlayUISound(g_audio.sndMove); }
+void PlayConfirmSound() { PlayUISound(g_audio.sndConfirm); }
+void PlayBackSound() { PlayUISound(g_audio.sndBack); }
+void PlayErrorSound() { PlayUISound(g_audio.sndError); }
+void PlayNotifySound() { PlayUISound(g_audio.sndNotify); }
+
+void PlayStartupSound() {
+    if (!g_audio.audioDeviceReady) return;
+    if (IsSoundLoaded(g_audio.sndStartup)) {
+        SetSoundVolume(g_audio.sndStartup, g_audio.masterVolume);
+        PlaySound(g_audio.sndStartup);
+    }
+}
+
+void UpdateBackgroundMusic() {
+    if (!g_audio.audioDeviceReady || !g_audio.musicEnabled) return;
+    if (g_audio.bgMusic.frameCount == 0) return;
+    
+    SetMusicVolume(g_audio.bgMusic, g_audio.musicVolume * g_audio.masterVolume);
+    UpdateMusicStream(g_audio.bgMusic);
+    
+    if (!IsMusicStreamPlaying(g_audio.bgMusic)) {
+        PlayMusicStream(g_audio.bgMusic);
+    }
+}
+
+void StopBackgroundMusic() {
+    if (g_audio.bgMusic.frameCount > 0 && IsMusicStreamPlaying(g_audio.bgMusic)) {
+        StopMusicStream(g_audio.bgMusic);
+    }
+}
+
+void CleanupAudioSystem() {
+    if (!g_audio.initialized) return;
+    
+    DebugLog("Cleaning up audio system...");
+    StopBackgroundMusic();
+    
+    if (IsSoundLoaded(g_audio.sndMove)) UnloadSound(g_audio.sndMove);
+    if (IsSoundLoaded(g_audio.sndConfirm)) UnloadSound(g_audio.sndConfirm);
+    if (IsSoundLoaded(g_audio.sndBack)) UnloadSound(g_audio.sndBack);
+    if (IsSoundLoaded(g_audio.sndStartup)) UnloadSound(g_audio.sndStartup);
+    if (IsSoundLoaded(g_audio.sndError)) UnloadSound(g_audio.sndError);
+    if (IsSoundLoaded(g_audio.sndNotify)) UnloadSound(g_audio.sndNotify);
+    if (g_audio.bgMusic.frameCount > 0) UnloadMusicStream(g_audio.bgMusic);
+    
+    CloseAudioDevice();
+    g_audio.initialized = false;
+    g_audio.audioDeviceReady = false;
+    DebugLog("Audio system cleaned up");
+}
+
+// ============================================================================
 // STRUCTS
 // ============================================================================
 
@@ -235,9 +545,15 @@ struct UIGame {
 
 struct UserProfile {
     std::string username = "Player";
-    std::string avatarPath;
+    std::string avatarPath = "";
     Texture2D avatar = {0};
     bool hasAvatar = false;
+    int themeIndex = 0;
+    float masterVolume = 0.8f;
+    float musicVolume = 0.3f;
+    float sfxVolume = 0.7f;
+    bool soundEnabled = true;
+    bool musicEnabled = true;
 };
 
 struct RunningTask {
@@ -264,9 +580,192 @@ struct ShareOption {
     Color accentColor;
 };
 
+struct Notification {
+    std::string title;
+    std::string message;
+    Color color;
+    float lifetime;
+    float elapsed;
+    float slideIn;
+    int icon;
+};
+
+std::vector<Notification> g_notifications;
+std::mutex g_notificationMutex;
+
 enum class StartupChoice { NONE, NORMAL_APP, SHELL_MODE, EXIT_SHELL };
 enum class ShellAction { NONE, EXPLORER, KEYBOARD, SETTINGS, TASKMGR, RESTART_SHELL, EXIT_SHELL, POWER };
 enum class PowerChoice { NONE, RESTART, SHUTDOWN, SLEEP, CANCEL };
+
+// ============================================================================
+// NOTIFICATION SYSTEM
+// ============================================================================
+
+void ShowNotification(const std::string& title, const std::string& message, int icon = 0, float duration = 4.0f) {
+    std::lock_guard<std::mutex> lock(g_notificationMutex);
+    
+    Color colors[] = { SKYBLUE, GREEN, YELLOW, RED, GOLD };
+    Notification n;
+    n.title = title;
+    n.message = message;
+    n.color = colors[icon % 5];
+    n.lifetime = duration;
+    n.elapsed = 0;
+    n.slideIn = 0;
+    n.icon = icon;
+    
+    g_notifications.push_back(n);
+    PlayNotifySound();
+}
+
+void UpdateAndDrawNotifications(int screenWidth, float deltaTime) {
+    std::lock_guard<std::mutex> lock(g_notificationMutex);
+    
+    float startY = 130;
+    float notifHeight = 75;
+    float gap = 8;
+    
+    for (int i = (int)g_notifications.size() - 1; i >= 0; i--) {
+        Notification& n = g_notifications[i];
+        n.elapsed += deltaTime;
+        
+        if (n.elapsed < 0.3f) n.slideIn = Lerp(n.slideIn, 1.0f, 0.12f);
+        else if (n.elapsed > n.lifetime - 0.5f) n.slideIn = Lerp(n.slideIn, 0.0f, 0.12f);
+        
+        if (n.elapsed >= n.lifetime) {
+            g_notifications.erase(g_notifications.begin() + i);
+            continue;
+        }
+        
+        float x = screenWidth - 380 * n.slideIn - 10;
+        float y = startY + i * (notifHeight + gap);
+        
+        DrawRectangleRounded({x, y, 370, notifHeight}, 0.12f, 10, Fade(g_theme.secondary, 0.95f));
+        DrawRectangle((int)x, (int)y, 4, (int)notifHeight, n.color);
+        
+        const char* icons[] = { "i", "+", "!", "X", "*" };
+        DrawCircle((int)(x + 35), (int)(y + notifHeight/2), 18, Fade(n.color, 0.2f));
+        int iconW = MeasureText(icons[n.icon], 18);
+        DrawText(icons[n.icon], (int)(x + 35 - iconW/2), (int)(y + notifHeight/2 - 9), 18, n.color);
+        
+        DrawText(n.title.c_str(), (int)(x + 65), (int)(y + 15), 16, g_theme.text);
+        DrawText(n.message.c_str(), (int)(x + 65), (int)(y + 38), 13, Fade(g_theme.text, 0.6f));
+        
+        float progress = 1.0f - (n.elapsed / n.lifetime);
+        DrawRectangle((int)(x + 65), (int)(y + notifHeight - 10), (int)(290 * progress), 2, Fade(n.color, 0.5f));
+    }
+}
+
+// ============================================================================
+// PROFILE MANAGEMENT
+// ============================================================================
+
+void SaveProfile(const std::vector<UIGame>& library, const std::string& bgPath, const UserProfile& profile) {
+    std::string profileDir = GetFullPath("profile");
+    fs::create_directories(profileDir);
+    fs::create_directories(GetFullPath("profile\\sounds"));
+    fs::create_directories(GetFullPath("profile\\intro"));
+    
+    std::ofstream cfg(profileDir + "\\config.txt");
+    if (cfg.is_open()) {
+        cfg << bgPath << "\n";
+        cfg << profile.username << "\n";
+        cfg << profile.avatarPath << "\n";
+        cfg << profile.themeIndex << "\n";
+        cfg << profile.masterVolume << "\n";
+        cfg << profile.musicVolume << "\n";
+        cfg << profile.sfxVolume << "\n";
+        cfg << (profile.soundEnabled ? 1 : 0) << "\n";
+        cfg << (profile.musicEnabled ? 1 : 0) << "\n";
+    }
+    cfg.close();
+    
+    std::ofstream libFile(profileDir + "\\library.txt");
+    if (libFile.is_open()) {
+        for (const auto& g : library) {
+            libFile << g.info.name << "|" << g.info.exePath << "|" << g.info.platform << "|" << g.info.appId << "\n";
+        }
+    }
+    libFile.close();
+    
+    DebugLog("Profile saved");
+}
+
+void LoadProfile(std::string& bgPath, UserProfile& profile) {
+    std::string configPath = GetFullPath("profile\\config.txt");
+    if (fs::exists(configPath)) {
+        std::ifstream cfg(configPath);
+        if (cfg.is_open()) {
+            std::string line;
+            if (std::getline(cfg, bgPath)) {}
+            if (std::getline(cfg, profile.username)) {}
+            if (std::getline(cfg, profile.avatarPath)) {}
+            if (std::getline(cfg, line)) profile.themeIndex = std::stoi(line);
+            if (std::getline(cfg, line)) profile.masterVolume = std::stof(line);
+            if (std::getline(cfg, line)) profile.musicVolume = std::stof(line);
+            if (std::getline(cfg, line)) profile.sfxVolume = std::stof(line);
+            if (std::getline(cfg, line)) profile.soundEnabled = (line == "1");
+            if (std::getline(cfg, line)) profile.musicEnabled = (line == "1");
+        }
+        cfg.close();
+    }
+    
+    if (profile.username.empty()) profile.username = "Player";
+    
+    // Apply loaded audio settings
+    g_audio.masterVolume = profile.masterVolume;
+    g_audio.musicVolume = profile.musicVolume;
+    g_audio.sfxVolume = profile.sfxVolume;
+    g_audio.soundEnabled = profile.soundEnabled;
+    g_audio.musicEnabled = profile.musicEnabled;
+    
+    // Apply theme
+    if (profile.themeIndex >= 0 && profile.themeIndex < (int)g_themes.size()) {
+        g_currentTheme = profile.themeIndex;
+        g_theme = g_themes[profile.themeIndex];
+        g_targetTheme = g_themes[profile.themeIndex];
+    }
+    
+    DebugLog("Profile loaded: " + profile.username);
+}
+
+void LoadProfileAvatar(UserProfile& profile) {
+    if (!profile.avatarPath.empty()) {
+        std::string fullPath = GetFullPath(profile.avatarPath);
+        if (!fs::exists(fullPath)) fullPath = profile.avatarPath;
+        
+        if (fs::exists(fullPath)) {
+            if (profile.hasAvatar && profile.avatar.id > 0) {
+                UnloadTexture(profile.avatar);
+            }
+            profile.avatar = LoadTexture(fullPath.c_str());
+            profile.hasAvatar = (profile.avatar.id > 0);
+            if (profile.hasAvatar) {
+                DebugLog("Loaded avatar: " + fullPath);
+            }
+        }
+    }
+}
+
+void RefreshLibrary(std::vector<UIGame>& library, const std::string& bgPath, const UserProfile& profile) {
+    std::vector<GameInfo> scanned = GetInstalledGames();
+    bool foundNew = false;
+    for (auto& s : scanned) {
+        bool exists = false;
+        for (const auto& lib : library) {
+            if (lib.info.exePath == s.exePath) { exists = true; break; }
+        }
+        if (!exists) {
+            library.push_back({ s, {0}, false, 0.0f, 0.0f });
+            foundNew = true;
+        }
+    }
+    if (foundNew) {
+        SaveProfile(library, bgPath, profile);
+        ShowNotification("Library Updated", std::to_string(scanned.size()) + " games found", 1);
+    }
+    DebugLog("Library refreshed: " + std::to_string(library.size()) + " games");
+}
 
 // ============================================================================
 // TASK LIST MANAGEMENT
@@ -274,7 +773,6 @@ enum class PowerChoice { NONE, RESTART, SHUTDOWN, SLEEP, CANCEL };
 
 BOOL CALLBACK EnumWindowsForTasks(HWND hwnd, LPARAM lParam) {
     auto* tasks = reinterpret_cast<std::vector<RunningTask>*>(lParam);
-
     if (!IsWindowVisible(hwnd)) return TRUE;
     if (GetWindowTextLengthA(hwnd) == 0) return TRUE;
 
@@ -286,11 +784,8 @@ BOOL CALLBACK EnumWindowsForTasks(HWND hwnd, LPARAM lParam) {
     GetWindowTextA(hwnd, title, 512);
     std::string titleStr(title);
 
-    // Filter out system windows and Q-Shell
-    if (titleStr == "Program Manager" || 
-        titleStr == "Windows Input Experience" ||
-        titleStr.find("Q-Shell") != std::string::npos ||
-        titleStr.empty()) return TRUE;
+    if (titleStr == "Program Manager" || titleStr == "Windows Input Experience" ||
+        titleStr.find("Q-Shell") != std::string::npos || titleStr.empty()) return TRUE;
 
     DWORD processId = 0;
     GetWindowThreadProcessId(hwnd, &processId);
@@ -344,16 +839,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (kbStruct->vkCode == VK_TAB) g_tabDown = true;
             if (kbStruct->vkCode == 'O') g_oDown = true;
             
-            // Tab + O = Task Switcher
             if (g_tabDown && g_oDown) {
                 DWORD now = GetTickCount();
                 if (now - g_lastTaskSwitchTime > DEBOUNCE_TIME) {
-                    std::lock_guard<std::mutex> lock(g_modeMutex);
-                    if (g_currentMode == UIMode::MAIN) {
-                        g_taskSwitcherRequested = true;
-                        g_lastTaskSwitchTime = now;
-                        DebugLog("Global Hotkey: Tab+O pressed");
-                    }
+                    g_taskSwitcherRequested = true;
+                    g_lastTaskSwitchTime = now;
+                    DebugLog("Global Hotkey: Tab+O pressed");
+                    return 1;
                 }
             }
         }
@@ -385,7 +877,6 @@ void InputMonitorThread() {
             DispatchMessage(&msg);
         }
         
-        // XInput monitoring (if available)
         if (g_XInputGetState) {
             for (DWORD i = 0; i < 4; i++) {
                 XINPUT_STATE_STRUCT state;
@@ -393,8 +884,6 @@ void InputMonitorThread() {
                 
                 if (SafeXInputGetState(i, &state) == ERROR_SUCCESS) {
                     WORD buttons = state.Gamepad.wButtons;
-                    
-                    // Share + X (View + X on Xbox controller) OR Start + Back
                     bool controllerPressed = ((buttons & XINPUT_GAMEPAD_BACK) && (buttons & XINPUT_GAMEPAD_X)) ||
                                              ((buttons & XINPUT_GAMEPAD_START) && (buttons & XINPUT_GAMEPAD_BACK));
                     
@@ -410,13 +899,11 @@ void InputMonitorThread() {
                             }
                         }
                     }
-                    
                     wasControllerPressed = controllerPressed;
                     break;
                 }
             }
         }
-        
         Sleep(10);
     }
 
@@ -424,7 +911,6 @@ void InputMonitorThread() {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = NULL;
     }
-    
     DebugLog("Input monitor thread stopped");
 }
 
@@ -455,13 +941,9 @@ public:
 
     void Update() {
         if (stickTimer > 0) stickTimer -= GetFrameTime();
-        
         gamepadID = -1;
         for (int i = 0; i < 4; i++) {
-            if (IsGamepadAvailable(i)) {
-                gamepadID = i;
-                break;
-            }
+            if (IsGamepadAvailable(i)) { gamepadID = i; break; }
         }
     }
 
@@ -566,6 +1048,22 @@ public:
     }
 
     bool IsBackgroundKey() { return IsKeyPressed(KEY_B); }
+    
+    bool IsLT() {
+        if (gamepadID >= 0) {
+            float trigger = GetGamepadAxisMovement(gamepadID, GAMEPAD_AXIS_LEFT_TRIGGER);
+            return trigger > 0.5f;
+        }
+        return IsKeyPressed(KEY_LEFT_BRACKET);
+    }
+    
+    bool IsRT() {
+        if (gamepadID >= 0) {
+            float trigger = GetGamepadAxisMovement(gamepadID, GAMEPAD_AXIS_RIGHT_TRIGGER);
+            return trigger > 0.5f;
+        }
+        return IsKeyPressed(KEY_RIGHT_BRACKET);
+    }
 };
 
 // ============================================================================
@@ -587,21 +1085,6 @@ void BringWindowToFront(HWND hwnd) {
     AttachThreadInput(currentThread, targetThread, FALSE);
 }
 
-void MakeQShellNotTopmost() {
-    if (g_mainWindow) {
-        SetWindowPos(g_mainWindow, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        g_windowOnTop = false;
-    }
-}
-
-void MakeQShellTopmost() {
-    if (g_mainWindow && g_isShellMode) {
-        SetWindowPos(g_mainWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-        SetForegroundWindow(g_mainWindow);
-        g_windowOnTop = true;
-    }
-}
-
 void SwitchToTask(int index) {
     if (index < 0 || index >= (int)g_tasks.size()) return;
     HWND hwnd = g_tasks[index].hwnd;
@@ -609,19 +1092,37 @@ void SwitchToTask(int index) {
     
     DebugLog("Switching to task: " + g_tasks[index].windowTitle);
     
-    if (g_isShellMode) {
-        MakeQShellNotTopmost();
-    } else if (g_mainWindow) {
-        ShowWindow(g_mainWindow, SW_MINIMIZE);
+    if (g_mainWindow) {
+        SetWindowPos(g_mainWindow, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (!g_isShellMode) ShowWindow(g_mainWindow, SW_MINIMIZE);
+        else ShowWindow(g_mainWindow, SW_HIDE);
+        g_windowOnTop = false;
     }
     
-    Sleep(100);
-    BringWindowToFront(hwnd);
+    Sleep(50);
+    
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+    
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(hwnd, NULL);
+    AttachThreadInput(currentThread, targetThread, TRUE);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetForegroundWindow(hwnd);
+    BringWindowToTop(hwnd);
+    SetFocus(hwnd);
+    SetActiveWindow(hwnd);
+    AttachThreadInput(currentThread, targetThread, FALSE);
 }
 
 void LaunchGame(const std::string& exePath) {
     DebugLog("Launching: " + exePath);
-    MakeQShellNotTopmost();
+    
+    if (g_mainWindow) {
+        SetWindowPos(g_mainWindow, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (!g_isShellMode) ShowWindow(g_mainWindow, SW_MINIMIZE);
+        else ShowWindow(g_mainWindow, SW_HIDE);
+        g_windowOnTop = false;
+    }
 
     if (exePath.find("://") != std::string::npos) {
         ShellExecuteA(NULL, "open", exePath.c_str(), NULL, NULL, SW_SHOWNORMAL);
@@ -638,23 +1139,23 @@ void LaunchGame(const std::string& exePath) {
         sei.lpDirectory = dir.c_str();
         sei.nShow = SW_SHOWNORMAL;
         
-        if (ShellExecuteExA(&sei)) {
-            Sleep(500);
-            if (sei.hProcess) CloseHandle(sei.hProcess);
-        }
+        ShellExecuteExA(&sei);
+        if (sei.hProcess) CloseHandle(sei.hProcess);
     }
 }
 
 void OpenURL(const std::string& url) {
     DebugLog("Opening URL: " + url);
-    MakeQShellNotTopmost();
+    
+    if (g_mainWindow) {
+        SetWindowPos(g_mainWindow, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (!g_isShellMode) ShowWindow(g_mainWindow, SW_MINIMIZE);
+        else ShowWindow(g_mainWindow, SW_HIDE);
+        g_windowOnTop = false;
+    }
+    
     ShellExecuteA(NULL, "open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
-    Sleep(300);
 }
-
-// ============================================================================
-// FILE UTILITIES
-// ============================================================================
 
 std::string OpenFilePicker(bool exeOnly) {
     char szFile[MAX_PATH] = {0};
@@ -672,10 +1173,16 @@ std::string OpenFilePicker(bool exeOnly) {
     return "";
 }
 
-void DownloadFileAsync(const std::string& url, const std::string& dest) {
-    std::thread([url, dest]() {
-        URLDownloadToFileA(NULL, url.c_str(), dest.c_str(), 0, NULL);
-    }).detach();
+void PhysicallyUninstall(UIGame& game) {
+    if (game.info.platform == "Steam" && !game.info.appId.empty()) {
+        std::string cmd = "steam://uninstall/" + game.info.appId;
+        ShellExecuteA(NULL, "open", cmd.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    } else {
+        try {
+            fs::path p(game.info.exePath);
+            if (fs::exists(p)) fs::remove_all(p.parent_path());
+        } catch (...) {}
+    }
 }
 
 // ============================================================================
@@ -685,6 +1192,7 @@ void DownloadFileAsync(const std::string& url, const std::string& dest) {
 LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exInfo) {
     DebugLog("!!! CRASH - Launching explorer !!!");
     StopInputMonitoring();
+    CleanupAudioSystem();
     STARTUPINFOA si = {sizeof(si)};
     PROCESS_INFORMATION pi;
     char cmd[] = "explorer.exe";
@@ -712,369 +1220,7 @@ void CreateEmergencyRestoreBatch() {
     bat << "echo RESTORE COMPLETE!\n";
     bat << "pause\n";
     bat.close();
-    DebugLog("Created emergency restore: " + batPath);
 }
-
-// ============================================================================
-// PROFILE MANAGEMENT
-// ============================================================================
-
-void SaveProfile(const std::vector<UIGame>& library, const std::string& bgPath, const UserProfile& profile) {
-    std::string profileDir = GetFullPath("profile");
-    fs::create_directories(profileDir);
-    
-    std::ofstream cfg(profileDir + "\\config.txt");
-    if (cfg.is_open()) {
-        cfg << bgPath << "\n" << profile.username << "\n" << profile.avatarPath << "\n";
-    }
-    cfg.close();
-
-    std::ofstream libFile(profileDir + "\\library.txt");
-    if (libFile.is_open()) {
-        for (const auto& g : library) {
-            libFile << g.info.name << "|" << g.info.exePath << "|" << g.info.platform << "|" << g.info.appId << "\n";
-        }
-    }
-    libFile.close();
-}
-
-void LoadProfile(std::string& bgPath, UserProfile& profile) {
-    std::string configPath = GetFullPath("profile\\config.txt");
-    if (fs::exists(configPath)) {
-        std::ifstream cfg(configPath);
-        if (cfg.is_open()) {
-            std::getline(cfg, bgPath);
-            std::getline(cfg, profile.username);
-            std::getline(cfg, profile.avatarPath);
-        }
-        cfg.close();
-    }
-    if (profile.username.empty()) profile.username = "Player";
-}
-
-void RefreshLibrary(std::vector<UIGame>& library, const std::string& bgPath, const UserProfile& profile) {
-    std::vector<GameInfo> scanned = GetInstalledGames();
-    bool foundNew = false;
-    for (auto& s : scanned) {
-        bool exists = false;
-        for (const auto& lib : library) {
-            if (lib.info.exePath == s.exePath) { exists = true; break; }
-        }
-        if (!exists) {
-            library.push_back({ s, {0}, false, 0.0f, 0.0f });
-            foundNew = true;
-        }
-    }
-    if (foundNew) SaveProfile(library, bgPath, profile);
-    DebugLog("Library refreshed: " + std::to_string(library.size()) + " games");
-}
-
-void PhysicallyUninstall(UIGame& game) {
-    if (game.info.platform == "Steam" && !game.info.appId.empty()) {
-        std::string cmd = "steam://uninstall/" + game.info.appId;
-        ShellExecuteA(NULL, "open", cmd.c_str(), NULL, NULL, SW_SHOWNORMAL);
-    } else {
-        try {
-            fs::path p(game.info.exePath);
-            if (fs::exists(p)) fs::remove_all(p.parent_path());
-        } catch (...) {}
-    }
-}
-
-void LoadMediaAppTextures(std::vector<MediaApp>& apps) {
-    for (auto& app : apps) {
-        if (!app.imagePath.empty() && !app.hasTexture) {
-            std::string fullPath = GetFullPath("profile\\" + app.imagePath);
-            if (!fs::exists(fullPath)) fullPath = GetFullPath("img\\" + app.imagePath);
-            if (fs::exists(fullPath)) {
-                app.texture = LoadTexture(fullPath.c_str());
-                app.hasTexture = (app.texture.id > 0);
-            }
-        }
-    }
-}
-
-// ============================================================================
-// VIDEO PLAYBACK FOR BOOT SCREEN (MCI-based)
-// ============================================================================
-
-bool PlayBootVideoMCI(const std::string& videoPath, int screenWidth, int screenHeight) {
-    std::string fullPath = GetFullPath(videoPath);
-    if (!fs::exists(fullPath)) {
-        DebugLog("Boot video not found: " + fullPath);
-        return false;
-    }
-    
-    DebugLog("Playing boot video (MCI): " + fullPath);
-    
-    // Create fullscreen window
-    WNDCLASSA wc = {0};
-    wc.lpfnWndProc = DefWindowProcA;
-    wc.hInstance = GetModuleHandle(NULL);
-    wc.lpszClassName = "QShellMCIVideo";
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    RegisterClassA(&wc);
-    
-    HWND videoWnd = CreateWindowExA(
-        WS_EX_TOPMOST,
-        "QShellMCIVideo",
-        "",
-        WS_POPUP,
-        0, 0, screenWidth, screenHeight,
-        NULL, NULL, GetModuleHandle(NULL), NULL
-    );
-    
-    ShowWindow(videoWnd, SW_SHOW);
-    UpdateWindow(videoWnd);
-    SetForegroundWindow(videoWnd);
-    
-    // Hide cursor using Win32 API
-    while (WindowsShowCursor(FALSE) >= 0);
-    
-    // Open video with MCI
-    std::string openCmd = "open \"" + fullPath + "\" type mpegvideo alias bootvid";
-    MCIERROR err = mciSendStringA(openCmd.c_str(), NULL, 0, NULL);
-    
-    if (err != 0) {
-        // Try without type specification
-        openCmd = "open \"" + fullPath + "\" alias bootvid";
-        err = mciSendStringA(openCmd.c_str(), NULL, 0, NULL);
-    }
-    
-    if (err == 0) {
-        // Set window
-        char buf[512];
-        snprintf(buf, sizeof(buf), "window bootvid handle %lld", (long long)(intptr_t)videoWnd);
-        mciSendStringA(buf, NULL, 0, NULL);
-        
-        // Set display area
-        snprintf(buf, sizeof(buf), "put bootvid window at 0 0 %d %d", screenWidth, screenHeight);
-        mciSendStringA(buf, NULL, 0, NULL);
-        
-        // Get video length
-        char lenBuf[64] = {0};
-        mciSendStringA("status bootvid length", lenBuf, sizeof(lenBuf), NULL);
-        DWORD videoLength = atoi(lenBuf);
-        if (videoLength == 0) videoLength = 10000; // Default 10 seconds
-        
-        // Play video
-        mciSendStringA("play bootvid", NULL, 0, NULL);
-        
-        // Wait for completion or skip
-        DWORD startTime = GetTickCount();
-        bool done = false;
-        
-        while (!done) {
-            // Check if video finished
-            char statusBuf[64] = {0};
-            mciSendStringA("status bootvid mode", statusBuf, sizeof(statusBuf), NULL);
-            if (strcmp(statusBuf, "stopped") == 0) {
-                done = true;
-                break;
-            }
-            
-            // Timeout check
-            if (GetTickCount() - startTime > videoLength + 2000) {
-                done = true;
-                break;
-            }
-            
-            // Check for skip input
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                if (msg.message == WM_KEYDOWN) {
-                    if (msg.wParam == VK_RETURN || msg.wParam == VK_SPACE || 
-                        msg.wParam == VK_ESCAPE) {
-                        done = true;
-                        break;
-                    }
-                }
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-            
-            // Gamepad skip
-            if (g_XInputGetState) {
-                for (DWORD i = 0; i < 4; i++) {
-                    XINPUT_STATE_STRUCT state;
-                    ZeroMemory(&state, sizeof(state));
-                    if (SafeXInputGetState(i, &state) == ERROR_SUCCESS) {
-                        if (state.Gamepad.wButtons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START)) {
-                            done = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            Sleep(16);
-        }
-        
-        // Stop and close
-        mciSendStringA("stop bootvid", NULL, 0, NULL);
-        mciSendStringA("close bootvid", NULL, 0, NULL);
-    } else {
-        char errBuf[256];
-        mciGetErrorStringA(err, errBuf, sizeof(errBuf));
-        DebugLog("MCI Error: " + std::string(errBuf));
-    }
-    
-    // Cleanup
-    DestroyWindow(videoWnd);
-    UnregisterClassA("QShellMCIVideo", GetModuleHandle(NULL));
-    
-    // Show cursor again
-    while (WindowsShowCursor(TRUE) < 0);
-    
-    DebugLog("Boot video playback finished");
-    return (err == 0);
-}
-
-// ============================================================================
-// BOOT SCREEN
-// ============================================================================
-
-void ShowBootScreen() {
-    DebugLog("ShowBootScreen starting...");
-
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    if (screenWidth <= 0) screenWidth = 1920;
-    if (screenHeight <= 0) screenHeight = 1080;
-
-    // Try to play video first
-    const char* videoPaths[] = {
-        "profile\\intro\\boot.mp4",
-        "profile\\intro\\intro.mp4",
-        "profile\\intro\\boot.avi",
-        "profile\\intro\\intro.avi",
-        "profile\\intro\\boot.wmv",
-        "profile\\intro\\intro.wmv"
-    };
-
-    for (const char* path : videoPaths) {
-        std::string fullPath = GetFullPath(path);
-        DebugLog("Checking for video: " + fullPath);
-        if (fs::exists(fullPath)) {
-            DebugLog("Found video file: " + fullPath);
-            
-            // Make sure XInput is loaded for gamepad skip
-            LoadXInput();
-            
-            if (PlayBootVideoMCI(path, screenWidth, screenHeight)) {
-                DebugLog("Video played successfully");
-                return;
-            }
-            
-            DebugLog("Failed to play video, trying next...");
-        }
-    }
-
-    DebugLog("No video found, showing logo animation");
-
-    // Fall back to logo/text animation
-    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST | FLAG_VSYNC_HINT);
-    InitWindow(screenWidth, screenHeight, "Q-Shell Boot");
-    SetWindowPosition(0, 0);
-    SetTargetFPS(60);
-    HideCursor();
-
-    HWND bootHwnd = (HWND)GetWindowHandle();
-    if (bootHwnd) {
-        SetWindowPos(bootHwnd, HWND_TOPMOST, 0, 0, screenWidth, screenHeight, SWP_SHOWWINDOW);
-        SetForegroundWindow(bootHwnd);
-    }
-
-    // Try to load logo image
-    Texture2D logoTex = {0};
-    bool hasLogo = false;
-    const char* imgPaths[] = { 
-        "profile\\intro\\logo.png", 
-        "profile\\intro\\intro.png", 
-        "profile\\intro\\boot.png",
-        "img\\logo.png" 
-    };
-    
-    for (const char* path : imgPaths) {
-        std::string fullPath = GetFullPath(path);
-        if (fs::exists(fullPath)) {
-            logoTex = LoadTexture(fullPath.c_str());
-            if (logoTex.id > 0) { 
-                hasLogo = true; 
-                DebugLog("Loaded logo: " + fullPath);
-                break; 
-            }
-        }
-    }
-
-    float elapsed = 0.0f;
-    float duration = 3.5f;
-    float glowPhase = 0.0f;
-
-    while (!WindowShouldClose() && elapsed < duration) {
-        elapsed += GetFrameTime();
-        glowPhase += GetFrameTime() * 2.0f;
-        
-        // Skip on input
-        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ESCAPE)) break;
-        for (int i = 0; i < 4; i++) {
-            if (IsGamepadAvailable(i) && (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) ||
-                IsGamepadButtonPressed(i, GAMEPAD_BUTTON_MIDDLE_RIGHT))) {
-                elapsed = duration;
-                break;
-            }
-        }
-        
-        // Fade in/out
-        float alpha = 1.0f;
-        if (elapsed < 0.5f) alpha = elapsed / 0.5f;
-        if (elapsed > duration - 0.5f) alpha = (duration - elapsed) / 0.5f;
-        alpha = Clamp(alpha, 0.0f, 1.0f);
-
-        BeginDrawing();
-        ClearBackground(BLACK);
-        
-        if (hasLogo && logoTex.id > 0) {
-            float scale = fminf((float)screenWidth / logoTex.width, (float)screenHeight / logoTex.height) * 0.5f;
-            float x = (screenWidth - logoTex.width * scale) / 2;
-            float y = (screenHeight - logoTex.height * scale) / 2;
-            
-            float glow = (sinf(glowPhase) + 1.0f) / 2.0f * 0.3f;
-            DrawTextureEx(logoTex, {x - 4, y - 4}, 0, scale * 1.02f, Fade(SKYBLUE, alpha * glow));
-            DrawTextureEx(logoTex, {x, y}, 0, scale, Fade(WHITE, alpha));
-        } else {
-            const char* logo = "Q-SHELL";
-            int fontSize = 120;
-            int textW = MeasureText(logo, fontSize);
-            
-            for (int i = 8; i >= 0; i--) {
-                float glowAlpha = alpha * 0.08f * (8 - i) * (0.5f + sinf(glowPhase + i * 0.2f) * 0.5f);
-                DrawText(logo, screenWidth/2 - textW/2 + i*2, screenHeight/2 - fontSize/2 + i*2, 
-                    fontSize, Fade(SKYBLUE, glowAlpha));
-            }
-            DrawText(logo, screenWidth/2 - textW/2, screenHeight/2 - fontSize/2, fontSize, Fade(WHITE, alpha));
-            
-            const char* sub = "GAMING CONSOLE";
-            int subW = MeasureText(sub, 24);
-            DrawText(sub, screenWidth/2 - subW/2, screenHeight/2 + 70, 24, Fade(GRAY, alpha * 0.8f));
-            
-            int dots = ((int)(elapsed * 3)) % 4;
-            std::string dotStr(dots, '.');
-            int dotW = MeasureText(dotStr.c_str(), 40);
-            DrawText(dotStr.c_str(), screenWidth/2 - dotW/2, screenHeight/2 + 120, 40, Fade(WHITE, alpha * 0.6f));
-        }
-        
-        DrawText("v2.5", screenWidth - 60, screenHeight - 30, 16, Fade(GRAY, alpha * 0.3f));
-        
-        EndDrawing();
-    }
-
-    if (hasLogo && logoTex.id > 0) UnloadTexture(logoTex);
-    CloseWindow();
-
-    DebugLog("Boot screen finished");
-}
-
 
 // ============================================================================
 // DRAWING HELPERS
@@ -1085,7 +1231,8 @@ void DrawCircularAvatar(Vector2 center, float radius, Texture2D avatar, bool has
         float scale = (radius * 2) / (float)avatar.width;
         DrawTextureEx(avatar, {center.x - radius, center.y - radius}, 0, scale, WHITE);
     } else {
-        DrawCircleGradient((int)center.x, (int)center.y, radius, {70, 75, 95, 255}, {45, 48, 62, 255});
+        DrawCircleGradient((int)center.x, (int)center.y, radius, 
+            ColorBrightness(g_theme.accent, -0.2f), ColorBrightness(g_theme.accent, -0.5f));
         char initial[2] = {username.empty() ? 'P' : (char)toupper(username[0]), '\0'};
         int fontSize = (int)(radius * 1.1f);
         int textW = MeasureText(initial, fontSize);
@@ -1096,7 +1243,7 @@ void DrawCircularAvatar(Vector2 center, float radius, Texture2D avatar, bool has
 
 void DrawGameCard(Rectangle card, UIGame& game, bool focused, float time) {
     DrawRectangleRounded({card.x + 5, card.y + 5, card.width, card.height}, 0.05f, 12, Fade(BLACK, 0.25f));
-    DrawRectangleRounded(card, 0.05f, 12, {35, 35, 40, 255});
+    DrawRectangleRounded(card, 0.05f, 12, g_theme.cardBg);
     float alpha = focused ? 1.0f : 0.25f;
 
     if (game.hasPoster && game.poster.id > 0) {
@@ -1114,12 +1261,12 @@ void DrawGameCard(Rectangle card, UIGame& game, bool focused, float time) {
     } else {
         char initial[2] = {game.info.name.empty() ? '?' : (char)toupper(game.info.name[0]), '\0'};
         int initW = MeasureText(initial, 80);
-        DrawText(initial, (int)(card.x + card.width/2 - initW/2), (int)(card.y + card.height/2 - 40), 80, Fade(WHITE, alpha * 0.2f));
+        DrawText(initial, (int)(card.x + card.width/2 - initW/2), (int)(card.y + card.height/2 - 40), 80, Fade(g_theme.text, alpha * 0.2f));
     }
 
     if (focused) {
         float pulse = (sinf(time * 4) + 1) / 2;
-        DrawRectangleRoundedLinesEx(card, 0.05f, 12, 4.0f, Fade(WHITE, 0.4f + pulse * 0.4f));
+        DrawRectangleRoundedLinesEx(card, 0.05f, 12, 4.0f, Fade(g_theme.accent, 0.4f + pulse * 0.4f));
     }
 }
 
@@ -1133,7 +1280,7 @@ void DrawMediaCard(Rectangle rect, MediaApp& app, bool focused, float time) {
     };
 
     DrawRectangleRounded({scaled.x + 4, scaled.y + 6, scaled.width, scaled.height}, 0.1f, 12, Fade(BLACK, focused ? 0.4f : 0.2f));
-    DrawRectangleRounded(scaled, 0.1f, 12, {24, 26, 34, 255});
+    DrawRectangleRounded(scaled, 0.1f, 12, g_theme.cardBg);
     
     Rectangle imageRect = {scaled.x, scaled.y, scaled.width, scaled.height * 0.65f};
     if (app.hasTexture && app.texture.id > 0) {
@@ -1148,7 +1295,7 @@ void DrawMediaCard(Rectangle rect, MediaApp& app, bool focused, float time) {
 
     float contentY = scaled.y + scaled.height * 0.68f;
     DrawRectangle((int)(scaled.x + 15), (int)(contentY + 5), 30, 3, app.accentColor);
-    DrawText(app.name.c_str(), (int)(scaled.x + 15), (int)(contentY + 12), 18, WHITE);
+    DrawText(app.name.c_str(), (int)(scaled.x + 15), (int)(contentY + 12), 18, g_theme.text);
 
     if (focused) {
         float pulse = (sinf(time * 4.5f) + 1.0f) / 2.0f;
@@ -1165,18 +1312,279 @@ void DrawSettingsTile(Rectangle rect, const char* icon, const char* title, Color
     };
 
     DrawRectangleRounded({scaled.x + 4, scaled.y + 4, scaled.width, scaled.height}, 0.15f, 12, Fade(BLACK, focused ? 0.3f : 0.18f));
-    Color bg = focused ? Color{40, 44, 56, 255} : Color{26, 28, 38, 255};
+    Color bg = focused ? ColorBrightness(g_theme.cardBg, 0.15f) : g_theme.cardBg;
     DrawRectangleRounded(scaled, 0.15f, 12, bg);
 
     int iconW = MeasureText(icon, 42);
     DrawText(icon, (int)(scaled.x + (scaled.width - iconW)/2), (int)(scaled.y + scaled.height * 0.28f), 42, focused ? accent : Fade(accent, 0.5f));
     int titleW = MeasureText(title, 16);
-    DrawText(title, (int)(scaled.x + (scaled.width - titleW)/2), (int)(scaled.y + scaled.height * 0.7f), 16, focused ? WHITE : Fade(WHITE, 0.55f));
+    DrawText(title, (int)(scaled.x + (scaled.width - titleW)/2), (int)(scaled.y + scaled.height * 0.7f), 16, focused ? g_theme.text : g_theme.textDim);
 
     if (focused) {
         float pulse = (sinf(time * 4) + 1.0f) / 2.0f;
         DrawRectangleRoundedLines(scaled, 0.15f, 12, Fade(accent, 0.35f + pulse * 0.3f));
     }
+}
+
+// ============================================================================
+// PROFILE EDIT OVERLAY
+// ============================================================================
+
+static int g_profileEditFocus = 0;
+static float g_profileEditSlide = 0.0f;
+static char g_usernameBuffer[64] = {0};
+static bool g_editingUsername = false;
+
+void HandleProfileEditOverlay(int screenWidth, int screenHeight, InputAdapter& input, float deltaTime,
+                               UserProfile& profile, const std::vector<UIGame>& library, const std::string& bgPath) {
+    g_profileEditSlide = Lerp(g_profileEditSlide, 1.0f, 0.12f);
+    float slideIn = g_profileEditSlide;
+    float time = (float)GetTime();
+    
+    // Options: Username, Avatar, Theme, Sound Volume, Music Volume, Sound On/Off, Music On/Off, Save
+    const int optionCount = 8;
+    
+    if (!g_editingUsername) {
+        if (input.IsMoveUp()) { g_profileEditFocus = (g_profileEditFocus - 1 + optionCount) % optionCount; PlayMoveSound(); }
+        if (input.IsMoveDown()) { g_profileEditFocus = (g_profileEditFocus + 1) % optionCount; PlayMoveSound(); }
+        
+        if (input.IsBack()) {
+            g_currentMode = UIMode::MAIN;
+            g_profileEditSlide = 0.0f;
+            PlayBackSound();
+            return;
+        }
+        
+        if (input.IsConfirm()) {
+            PlayConfirmSound();
+            switch (g_profileEditFocus) {
+                case 0: // Username
+                    g_editingUsername = true;
+                    strncpy(g_usernameBuffer, profile.username.c_str(), 63);
+                    break;
+                case 1: { // Avatar
+                    std::string avatarFile = OpenFilePicker(false);
+                    if (!avatarFile.empty()) {
+                        std::string destPath = GetFullPath("profile\\avatar.png");
+                        fs::copy_file(avatarFile, destPath, fs::copy_options::overwrite_existing);
+                        profile.avatarPath = "profile\\avatar.png";
+                        LoadProfileAvatar(profile);
+                        ShowNotification("Avatar Updated", "New profile picture set", 1);
+                    }
+                }   break;
+                case 2: // Theme
+                    g_currentMode = UIMode::THEME_SELECT;
+                    break;
+                case 5: // Sound toggle
+                    profile.soundEnabled = !profile.soundEnabled;
+                    g_audio.soundEnabled = profile.soundEnabled;
+                    break;
+                case 6: // Music toggle
+                    profile.musicEnabled = !profile.musicEnabled;
+                    g_audio.musicEnabled = profile.musicEnabled;
+                    if (!profile.musicEnabled) StopBackgroundMusic();
+                    break;
+                case 7: // Save
+                    SaveProfile(library, bgPath, profile);
+                    ShowNotification("Profile Saved", "Settings updated", 1);
+                    g_currentMode = UIMode::MAIN;
+                    g_profileEditSlide = 0.0f;
+                    break;
+            }
+        }
+        
+        // Volume adjustment
+        if (g_profileEditFocus == 3) { // SFX Volume
+            if (input.IsMoveLeft()) { profile.sfxVolume = Clamp(profile.sfxVolume - 0.1f, 0, 1); g_audio.sfxVolume = profile.sfxVolume; PlayMoveSound(); }
+            if (input.IsMoveRight()) { profile.sfxVolume = Clamp(profile.sfxVolume + 0.1f, 0, 1); g_audio.sfxVolume = profile.sfxVolume; PlayMoveSound(); }
+        }
+        if (g_profileEditFocus == 4) { // Music Volume
+            if (input.IsMoveLeft()) { profile.musicVolume = Clamp(profile.musicVolume - 0.1f, 0, 1); g_audio.musicVolume = profile.musicVolume; PlayMoveSound(); }
+            if (input.IsMoveRight()) { profile.musicVolume = Clamp(profile.musicVolume + 0.1f, 0, 1); g_audio.musicVolume = profile.musicVolume; PlayMoveSound(); }
+        }
+    } else {
+        // Text input mode
+        int key = GetCharPressed();
+        while (key > 0) {
+            if (strlen(g_usernameBuffer) < 20 && key >= 32 && key < 127) {
+                int len = strlen(g_usernameBuffer);
+                g_usernameBuffer[len] = (char)key;
+                g_usernameBuffer[len + 1] = '\0';
+            }
+            key = GetCharPressed();
+        }
+        
+        if (IsKeyPressed(KEY_BACKSPACE) && strlen(g_usernameBuffer) > 0) {
+            g_usernameBuffer[strlen(g_usernameBuffer) - 1] = '\0';
+        }
+        
+        if (IsKeyPressed(KEY_ENTER)) {
+            profile.username = g_usernameBuffer;
+            g_editingUsername = false;
+            ShowNotification("Username Changed", profile.username, 1);
+        }
+        
+        if (IsKeyPressed(KEY_ESCAPE)) {
+            g_editingUsername = false;
+        }
+    }
+    
+    // Draw
+    DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.85f * slideIn));
+    
+    float panelW = 550, panelH = 580;
+    float panelX = (screenWidth - panelW) / 2;
+    float panelY = (screenHeight - panelH) / 2 + (1.0f - slideIn) * 50;
+    
+    DrawRectangleRounded({panelX, panelY, panelW, panelH}, 0.05f, 12, Fade(g_theme.secondary, 0.98f));
+    DrawRectangleRoundedLines({panelX, panelY, panelW, panelH}, 0.05f, 12, Fade(g_theme.accent, 0.3f));
+    
+    DrawText("PROFILE SETTINGS", (int)(panelX + 30), (int)(panelY + 25), 28, g_theme.text);
+    DrawRectangle((int)(panelX + 30), (int)(panelY + 60), 150, 3, g_theme.accent);
+    
+    // Avatar preview
+    DrawCircularAvatar({panelX + panelW - 80, panelY + 70}, 45, profile.avatar, profile.hasAvatar, profile.username);
+    
+    float optY = panelY + 100;
+    float optH = 52;
+    float gap = 8;
+    
+    const char* labels[] = {"Username", "Avatar", "Theme", "Sound Volume", "Music Volume", "Sound Effects", "Background Music", "Save Changes"};
+    
+    for (int i = 0; i < optionCount; i++) {
+        Rectangle btn = {panelX + 20, optY + i * (optH + gap), panelW - 40, optH};
+        bool focused = (g_profileEditFocus == i && !g_editingUsername);
+        
+        DrawRectangleRounded(btn, 0.15f, 10, focused ? Fade(g_theme.accent, 0.15f) : Fade(g_theme.cardBg, 0.5f));
+        if (focused) {
+            float pulse = (sinf(time * 4) + 1) / 2;
+            DrawRectangleRoundedLines(btn, 0.15f, 10, Fade(g_theme.accent, 0.4f + pulse * 0.3f));
+        }
+        
+        DrawText(labels[i], (int)(btn.x + 20), (int)(btn.y + 16), 18, focused ? g_theme.text : g_theme.textDim);
+        
+        // Value display on right side
+        if (i == 0) {
+            if (g_editingUsername) {
+                std::string displayText = std::string(g_usernameBuffer) + "_";
+                DrawText(displayText.c_str(), (int)(btn.x + btn.width - 200), (int)(btn.y + 16), 18, g_theme.accent);
+            } else {
+                DrawText(profile.username.c_str(), (int)(btn.x + btn.width - 200), (int)(btn.y + 16), 18, g_theme.textDim);
+            }
+        }
+        else if (i == 2) {
+            DrawText(g_themes[g_currentTheme].name.c_str(), (int)(btn.x + btn.width - 180), (int)(btn.y + 16), 16, g_theme.accent);
+        }
+        else if (i == 3 || i == 4) {
+            float vol = (i == 3) ? profile.sfxVolume : profile.musicVolume;
+            float barW = 120;
+            DrawRectangle((int)(btn.x + btn.width - barW - 60), (int)(btn.y + 20), (int)barW, 12, Fade(g_theme.cardBg, 0.8f));
+            DrawRectangle((int)(btn.x + btn.width - barW - 60), (int)(btn.y + 20), (int)(barW * vol), 12, g_theme.accent);
+            DrawText(TextFormat("%d%%", (int)(vol * 100)), (int)(btn.x + btn.width - 50), (int)(btn.y + 16), 16, g_theme.textDim);
+        }
+        else if (i == 5) {
+            Color c = profile.soundEnabled ? g_theme.success : g_theme.danger;
+            DrawText(profile.soundEnabled ? "ON" : "OFF", (int)(btn.x + btn.width - 60), (int)(btn.y + 16), 18, c);
+        }
+        else if (i == 6) {
+            Color c = profile.musicEnabled ? g_theme.success : g_theme.danger;
+            DrawText(profile.musicEnabled ? "ON" : "OFF", (int)(btn.x + btn.width - 60), (int)(btn.y + 16), 18, c);
+        }
+        else if (i == 7) {
+            DrawText(">", (int)(btn.x + btn.width - 40), (int)(btn.y + 14), 22, g_theme.success);
+        }
+    }
+    
+    // Hints
+    DrawText("[A] Select  |  [B] Back  |  Left/Right: Adjust", (int)(panelX + 30), (int)(panelY + panelH - 35), 12, Fade(g_theme.textDim, 0.6f));
+}
+
+// ============================================================================
+// THEME SELECT OVERLAY
+// ============================================================================
+
+static int g_themeSelectFocus = 0;
+static float g_themeSelectSlide = 0.0f;
+
+void HandleThemeSelectOverlay(int screenWidth, int screenHeight, InputAdapter& input, float deltaTime,
+                               UserProfile& profile) {
+    g_themeSelectSlide = Lerp(g_themeSelectSlide, 1.0f, 0.12f);
+    float slideIn = g_themeSelectSlide;
+    float time = (float)GetTime();
+    
+    int themeCount = (int)g_themes.size();
+    int cols = 2;
+    
+    if (input.IsMoveUp()) { g_themeSelectFocus = std::max(0, g_themeSelectFocus - cols); PlayMoveSound(); }
+    if (input.IsMoveDown()) { g_themeSelectFocus = std::min(themeCount - 1, g_themeSelectFocus + cols); PlayMoveSound(); }
+    if (input.IsMoveLeft()) { g_themeSelectFocus = std::max(0, g_themeSelectFocus - 1); PlayMoveSound(); }
+    if (input.IsMoveRight()) { g_themeSelectFocus = std::min(themeCount - 1, g_themeSelectFocus + 1); PlayMoveSound(); }
+    
+    // Live preview
+    SetTheme(g_themeSelectFocus);
+    
+    if (input.IsBack()) {
+        SetTheme(profile.themeIndex); // Revert if cancelled
+        g_currentMode = UIMode::PROFILE_EDIT;
+        g_themeSelectSlide = 0.0f;
+        PlayBackSound();
+        return;
+    }
+    
+    if (input.IsConfirm()) {
+        profile.themeIndex = g_themeSelectFocus;
+        g_currentMode = UIMode::PROFILE_EDIT;
+        g_themeSelectSlide = 0.0f;
+        ShowNotification("Theme Applied", g_themes[g_themeSelectFocus].name, 1);
+        PlayConfirmSound();
+        return;
+    }
+    
+    // Draw
+    DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.9f * slideIn));
+    
+    DrawText("SELECT THEME", screenWidth/2 - 100, 60, 36, Fade(g_theme.text, slideIn));
+    DrawRectangle(screenWidth/2 - 80, 105, 160, 3, Fade(g_theme.accent, slideIn));
+    
+    float cardW = 280, cardH = 120, gap = 20;
+    float startX = (screenWidth - (cols * cardW + (cols - 1) * gap)) / 2;
+    float startY = 150;
+    
+    for (int i = 0; i < themeCount; i++) {
+        int row = i / cols;
+        int col = i % cols;
+        float x = startX + col * (cardW + gap);
+        float y = startY + row * (cardH + gap);
+        
+        bool focused = (i == g_themeSelectFocus);
+        Theme& t = g_themes[i];
+        
+        // Card background
+        DrawRectangleRounded({x, y, cardW, cardH}, 0.1f, 10, Fade(t.secondary, 0.95f * slideIn));
+        
+        // Color preview swatches
+        DrawRectangle((int)(x + 20), (int)(y + 50), 40, 25, Fade(t.primary, slideIn));
+        DrawRectangle((int)(x + 65), (int)(y + 50), 40, 25, Fade(t.accent, slideIn));
+        DrawRectangle((int)(x + 110), (int)(y + 50), 40, 25, Fade(t.accentAlt, slideIn));
+        DrawRectangle((int)(x + 155), (int)(y + 50), 40, 25, Fade(t.cardBg, slideIn));
+        
+        // Name
+        DrawText(t.name.c_str(), (int)(x + 20), (int)(y + 18), 18, Fade(t.text, slideIn));
+        
+        // Checkmark for current
+        if (i == profile.themeIndex) {
+            DrawText("*", (int)(x + cardW - 35), (int)(y + 15), 24, Fade(t.success, slideIn));
+        }
+        
+        // Selection highlight
+        if (focused) {
+            float pulse = (sinf(time * 4) + 1) / 2;
+            DrawRectangleRoundedLines({x, y, cardW, cardH}, 0.1f, 10, Fade(t.accent, (0.5f + pulse * 0.5f) * slideIn));
+        }
+    }
+    
+    // Hints
+    DrawText("[A] Apply  |  [B] Cancel", screenWidth/2 - 90, screenHeight - 60, 16, Fade(g_theme.textDim, 0.6f * slideIn));
 }
 
 // ============================================================================
@@ -1189,28 +1597,26 @@ bool HandleTaskSwitcherOverlay(int screenWidth, int screenHeight, InputAdapter& 
     
     int cols = std::max(2, std::min(4, (screenWidth - 100) / 350));
     
-    // Navigation
-    if (input.IsMoveLeft()) g_taskFocusIndex = std::max(0, g_taskFocusIndex - 1);
-    if (input.IsMoveRight()) g_taskFocusIndex = std::min((int)g_tasks.size() - 1, g_taskFocusIndex + 1);
-    if (input.IsMoveUp()) g_taskFocusIndex = std::max(0, g_taskFocusIndex - cols);
-    if (input.IsMoveDown()) g_taskFocusIndex = std::min((int)g_tasks.size() - 1, g_taskFocusIndex + cols);
+    if (input.IsMoveLeft()) { g_taskFocusIndex = std::max(0, g_taskFocusIndex - 1); PlayMoveSound(); }
+    if (input.IsMoveRight()) { g_taskFocusIndex = std::min((int)g_tasks.size() - 1, g_taskFocusIndex + 1); PlayMoveSound(); }
+    if (input.IsMoveUp()) { g_taskFocusIndex = std::max(0, g_taskFocusIndex - cols); PlayMoveSound(); }
+    if (input.IsMoveDown()) { g_taskFocusIndex = std::min((int)g_tasks.size() - 1, g_taskFocusIndex + cols); PlayMoveSound(); }
     
-    // Select task
     if (input.IsConfirm() && !g_tasks.empty()) {
         SwitchToTask(g_taskFocusIndex);
         g_currentMode = UIMode::MAIN;
         g_taskSwitcherSlideIn = 0.0f;
+        PlayConfirmSound();
         return true;
     }
     
-    // Cancel
     if (input.IsBack()) {
         g_currentMode = UIMode::MAIN;
         g_taskSwitcherSlideIn = 0.0f;
+        PlayBackSound();
         return true;
     }
     
-    // Close task with X
     if (input.IsDeletePressed() && g_taskFocusIndex < (int)g_tasks.size()) {
         PostMessage(g_tasks[g_taskFocusIndex].hwnd, WM_CLOSE, 0, 0);
         Sleep(100);
@@ -1225,28 +1631,21 @@ bool HandleTaskSwitcherOverlay(int screenWidth, int screenHeight, InputAdapter& 
     
     float slideIn = g_taskSwitcherSlideIn;
     
-    // Draw overlay
     DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.88f * slideIn));
     for (int i = 0; i < 200; i++) {
         float alpha = (1.0f - (float)i / 200.0f) * 0.15f * slideIn;
-        DrawRectangle(0, i, screenWidth, 1, Fade(SKYBLUE, alpha));
+        DrawRectangle(0, i, screenWidth, 1, Fade(g_theme.accent, alpha));
     }
     
     const char* title = "RUNNING APPLICATIONS";
     int titleW = MeasureText(title, 40);
     float titleY = 60 - (1.0f - slideIn) * 50;
-    DrawText(title, screenWidth/2 - titleW/2, (int)titleY, 40, Fade(WHITE, slideIn));
-    DrawRectangle((int)(screenWidth/2 - 100 * slideIn), (int)(titleY + 50), (int)(200 * slideIn), 4, Fade(SKYBLUE, slideIn));
-    
-    const char* subtitle = TextFormat("%d apps running", (int)g_tasks.size());
-    int subW = MeasureText(subtitle, 18);
-    DrawText(subtitle, screenWidth/2 - subW/2, (int)(titleY + 65), 18, Fade(GRAY, slideIn * 0.7f));
+    DrawText(title, screenWidth/2 - titleW/2, (int)titleY, 40, Fade(g_theme.text, slideIn));
+    DrawRectangle((int)(screenWidth/2 - 100 * slideIn), (int)(titleY + 50), (int)(200 * slideIn), 4, Fade(g_theme.accent, slideIn));
     
     if (g_tasks.empty()) {
-        const char* noTasks = "No other applications running";
-        int noTasksW = MeasureText(noTasks, 24);
-        DrawText(noTasks, screenWidth/2 - noTasksW/2, screenHeight/2, 24, Fade(GRAY, slideIn));
-        DrawText("Press [B] to return", screenWidth/2 - 80, screenHeight/2 + 40, 18, Fade(WHITE, slideIn * 0.5f));
+        DrawText("No other applications running", screenWidth/2 - 150, screenHeight/2, 24, Fade(g_theme.textDim, slideIn));
+        DrawText("Press [B] to return", screenWidth/2 - 80, screenHeight/2 + 40, 18, Fade(g_theme.text, slideIn * 0.5f));
     } else {
         float cardW = 320, cardH = 220, gap = 25;
         int maxCards = std::min((int)g_tasks.size(), 12);
@@ -1255,8 +1654,7 @@ bool HandleTaskSwitcherOverlay(int screenWidth, int screenHeight, InputAdapter& 
         float startY = 150;
         
         for (int i = 0; i < maxCards; i++) {
-            int row = i / cols;
-            int col = i % cols;
+            int row = i / cols, col = i % cols;
             float cardX = startX + col * (cardW + gap);
             float cardY = startY + row * (cardH + gap);
             
@@ -1274,56 +1672,55 @@ bool HandleTaskSwitcherOverlay(int screenWidth, int screenHeight, InputAdapter& 
             float scaledY = cardY - (scaledH - cardH) / 2 - (selected ? 5 : 0);
             
             DrawRectangleRounded({scaledX + 6, scaledY + 8, scaledW, scaledH}, 0.08f, 12, Fade(BLACK, 0.4f * cardAlpha));
-            Color bgCol = selected ? Color{55, 60, 80, 255} : Color{32, 36, 48, 255};
+            Color bgCol = selected ? ColorBrightness(g_theme.cardBg, 0.2f) : g_theme.cardBg;
             DrawRectangleRounded({scaledX, scaledY, scaledW, scaledH}, 0.08f, 12, Fade(bgCol, cardAlpha));
             
             if (selected) {
                 float pulse = (sinf(g_taskSwitcherAnimTime * 4.5f) + 1) / 2;
-                DrawRectangleRoundedLinesEx({scaledX - 2, scaledY - 2, scaledW + 4, scaledH + 4}, 0.08f, 12, 3.0f, Fade(SKYBLUE, (0.5f + pulse * 0.5f) * cardAlpha));
+                DrawRectangleRoundedLinesEx({scaledX - 2, scaledY - 2, scaledW + 4, scaledH + 4}, 0.08f, 12, 3.0f, Fade(g_theme.accent, (0.5f + pulse * 0.5f) * cardAlpha));
             }
             
             Rectangle iconRect = {scaledX + 20, scaledY + 25, 70, 70};
-            DrawRectangleRounded(iconRect, 0.2f, 8, Fade({65, 70, 90, 255}, cardAlpha));
+            DrawRectangleRounded(iconRect, 0.2f, 8, Fade(g_theme.secondary, cardAlpha));
             char initial = task.name.empty() ? '?' : toupper(task.name[0]);
             char initStr[2] = {initial, 0};
             int initW = MeasureText(initStr, 36);
-            DrawText(initStr, (int)(iconRect.x + 35 - initW/2), (int)(iconRect.y + 17), 36, Fade(selected ? SKYBLUE : WHITE, cardAlpha * 0.8f));
+            DrawText(initStr, (int)(iconRect.x + 35 - initW/2), (int)(iconRect.y + 17), 36, Fade(selected ? g_theme.accent : g_theme.text, cardAlpha * 0.8f));
             
             std::string name = task.name;
             if (name.length() > 4 && name.substr(name.length() - 4) == ".exe") name = name.substr(0, name.length() - 4);
             if (name.length() > 20) name = name.substr(0, 18) + "..";
-            DrawText(name.c_str(), (int)(scaledX + 105), (int)(scaledY + 35), 20, Fade(WHITE, cardAlpha));
+            DrawText(name.c_str(), (int)(scaledX + 105), (int)(scaledY + 35), 20, Fade(g_theme.text, cardAlpha));
             
             std::string winTitle = task.windowTitle;
             if (winTitle.length() > 32) winTitle = winTitle.substr(0, 30) + "..";
-            DrawText(winTitle.c_str(), (int)(scaledX + 105), (int)(scaledY + 62), 13, Fade(GRAY, cardAlpha * 0.8f));
+            DrawText(winTitle.c_str(), (int)(scaledX + 105), (int)(scaledY + 62), 13, Fade(g_theme.textDim, cardAlpha * 0.8f));
             
-            DrawCircle((int)(scaledX + 30), (int)(scaledY + 115), 6, Fade(GREEN, cardAlpha));
-            DrawText("Running", (int)(scaledX + 45), (int)(scaledY + 107), 14, Fade(GREEN, cardAlpha * 0.9f));
+            DrawCircle((int)(scaledX + 30), (int)(scaledY + 115), 6, Fade(g_theme.success, cardAlpha));
+            DrawText("Running", (int)(scaledX + 45), (int)(scaledY + 107), 14, Fade(g_theme.success, cardAlpha * 0.9f));
             
             if (selected) {
                 float hintsY = scaledY + scaledH - 45;
-                DrawRectangle((int)(scaledX + 15), (int)(hintsY - 8), (int)(scaledW - 30), 1, Fade(WHITE, 0.1f * cardAlpha));
-                DrawRectangleRounded({scaledX + 20, hintsY, 90, 28}, 0.3f, 8, Fade(GREEN, 0.2f * cardAlpha));
-                DrawText("[A] Switch", (int)(scaledX + 30), (int)(hintsY + 6), 14, Fade(GREEN, cardAlpha));
-                DrawRectangleRounded({scaledX + 125, hintsY, 85, 28}, 0.3f, 8, Fade(RED, 0.2f * cardAlpha));
-                DrawText("[X] Close", (int)(scaledX + 135), (int)(hintsY + 6), 14, Fade(RED, cardAlpha));
+                DrawRectangle((int)(scaledX + 15), (int)(hintsY - 8), (int)(scaledW - 30), 1, Fade(g_theme.text, 0.1f * cardAlpha));
+                DrawRectangleRounded({scaledX + 20, hintsY, 90, 28}, 0.3f, 8, Fade(g_theme.success, 0.2f * cardAlpha));
+                DrawText("[A] Switch", (int)(scaledX + 30), (int)(hintsY + 6), 14, Fade(g_theme.success, cardAlpha));
+                DrawRectangleRounded({scaledX + 125, hintsY, 85, 28}, 0.3f, 8, Fade(g_theme.danger, 0.2f * cardAlpha));
+                DrawText("[X] Close", (int)(scaledX + 135), (int)(hintsY + 6), 14, Fade(g_theme.danger, cardAlpha));
             }
         }
     }
     
     float barY = screenHeight - 80;
     DrawRectangle(0, (int)barY, screenWidth, 80, Fade(BLACK, 0.6f * slideIn));
-    DrawRectangle(0, (int)barY, screenWidth, 1, Fade(WHITE, 0.1f * slideIn));
     const char* hints = "DPAD: Navigate    |    [A]: Switch    |    [X]: Close    |    [B]: Cancel";
     int hintsW = MeasureText(hints, 16);
-    DrawText(hints, screenWidth/2 - hintsW/2, (int)(barY + 30), 16, Fade(WHITE, 0.5f * slideIn));
+    DrawText(hints, screenWidth/2 - hintsW/2, (int)(barY + 30), 16, Fade(g_theme.textDim, 0.5f * slideIn));
     
     return false;
 }
 
 // ============================================================================
-// SHELL MENU OVERLAY
+// SHELL MENU & POWER MENU OVERLAYS
 // ============================================================================
 
 static int g_shellMenuFocused = 0;
@@ -1335,22 +1732,24 @@ ShellAction HandleShellMenuOverlay(int screenWidth, int screenHeight, InputAdapt
     
     const char* options[] = {"File Explorer", "Keyboard", "Settings", "Task Manager", "Restart Q-Shell", "Exit Shell", "Power"};
     const char* descs[] = {"Open Windows Explorer", "On-screen keyboard", "System settings", "View processes", "Restart interface", "Return to Explorer", "Shutdown/Restart/Sleep"};
-    Color colors[] = {SKYBLUE, ORANGE, PURPLE, GREEN, YELLOW, RED, GRAY};
+    Color colors[] = {g_theme.accent, ORANGE, PURPLE, g_theme.success, YELLOW, g_theme.danger, GRAY};
     const char* icons[] = {"E", "K", "S", "T", "R", "X", "P"};
     int optCount = 7;
     
-    if (input.IsMoveUp()) g_shellMenuFocused = (g_shellMenuFocused - 1 + optCount) % optCount;
-    if (input.IsMoveDown()) g_shellMenuFocused = (g_shellMenuFocused + 1) % optCount;
+    if (input.IsMoveUp()) { g_shellMenuFocused = (g_shellMenuFocused - 1 + optCount) % optCount; PlayMoveSound(); }
+    if (input.IsMoveDown()) { g_shellMenuFocused = (g_shellMenuFocused + 1) % optCount; PlayMoveSound(); }
     
     if (input.IsBack() || input.IsMenu()) {
         g_currentMode = UIMode::MAIN;
         g_shellMenuSlideIn = 0.0f;
+        PlayBackSound();
         return ShellAction::NONE;
     }
     
     if (input.IsConfirm()) {
         g_currentMode = UIMode::MAIN;
         g_shellMenuSlideIn = 0.0f;
+        PlayConfirmSound();
         return (ShellAction)(g_shellMenuFocused + 1);
     }
     
@@ -1362,16 +1761,16 @@ ShellAction HandleShellMenuOverlay(int screenWidth, int screenHeight, InputAdapt
     float menuY = (screenHeight - menuH) / 2;
     
     DrawRectangleRounded({menuX + 8, menuY + 10, menuW, menuH}, 0.05f, 14, Fade(BLACK, 0.5f));
-    DrawRectangleRounded({menuX, menuY, menuW, menuH}, 0.05f, 14, {18, 22, 32, 250});
-    DrawRectangleRoundedLines({menuX, menuY, menuW, menuH}, 0.05f, 14, Fade(SKYBLUE, 0.3f));
+    DrawRectangleRounded({menuX, menuY, menuW, menuH}, 0.05f, 14, Fade(g_theme.secondary, 0.98f));
+    DrawRectangleRoundedLines({menuX, menuY, menuW, menuH}, 0.05f, 14, Fade(g_theme.accent, 0.3f));
     
-    DrawText("SHELL MENU", (int)(menuX + 28), (int)(menuY + 22), 28, WHITE);
-    DrawRectangle((int)(menuX + 28), (int)(menuY + 58), 130, 3, SKYBLUE);
+    DrawText("SHELL MENU", (int)(menuX + 28), (int)(menuY + 22), 28, g_theme.text);
+    DrawRectangle((int)(menuX + 28), (int)(menuY + 58), 130, 3, g_theme.accent);
     
     for (int i = 0; i < optCount; i++) {
         Rectangle btn = {menuX + 18, menuY + 78 + i * 58, menuW - 36, 52};
         bool focused = (g_shellMenuFocused == i);
-        DrawRectangleRounded(btn, 0.18f, 10, focused ? Fade(colors[i], 0.15f) : Fade(WHITE, 0.02f));
+        DrawRectangleRounded(btn, 0.18f, 10, focused ? Fade(colors[i], 0.15f) : Fade(g_theme.cardBg, 0.3f));
         if (focused) {
             float pulse = (sinf(animTime * 4) + 1) / 2;
             DrawRectangleRoundedLines(btn, 0.18f, 10, Fade(colors[i], 0.4f + pulse * 0.3f));
@@ -1380,24 +1779,12 @@ ShellAction HandleShellMenuOverlay(int screenWidth, int screenHeight, InputAdapt
         DrawCircle((int)iconX, (int)(btn.y + 26), 18, Fade(colors[i], focused ? 0.22f : 0.1f));
         int iconW = MeasureText(icons[i], 16);
         DrawText(icons[i], (int)(iconX - iconW/2), (int)(btn.y + 18), 16, Fade(colors[i], focused ? 1.0f : 0.55f));
-        DrawText(options[i], (int)(btn.x + 18), (int)(btn.y + 9), 17, focused ? WHITE : Fade(WHITE, 0.6f));
-        DrawText(descs[i], (int)(btn.x + 18), (int)(btn.y + 31), 11, Fade(WHITE, 0.35f));
+        DrawText(options[i], (int)(btn.x + 18), (int)(btn.y + 9), 17, focused ? g_theme.text : g_theme.textDim);
+        DrawText(descs[i], (int)(btn.x + 18), (int)(btn.y + 31), 11, Fade(g_theme.textDim, 0.6f));
     }
-    
-    time_t now = time(0);
-    struct tm* ltm = localtime(&now);
-    char timeStr[32];
-    strftime(timeStr, sizeof(timeStr), "%H:%M  |  %a, %b %d", ltm);
-    int timeW = MeasureText(timeStr, 14);
-    DrawText(timeStr, (int)(menuX + menuW - timeW - 22), (int)(menuY + menuH - 35), 14, Fade(WHITE, 0.45f));
-    DrawText("[A] Select  |  [B] Close", (int)(menuX + 22), (int)(menuY + menuH - 35), 12, Fade(WHITE, 0.35f));
     
     return ShellAction::NONE;
 }
-
-// ============================================================================
-// POWER MENU OVERLAY
-// ============================================================================
 
 static int g_powerMenuFocused = 0;
 static float g_powerMenuSlideIn = 0.0f;
@@ -1408,20 +1795,22 @@ PowerChoice HandlePowerMenuOverlay(int screenWidth, int screenHeight, InputAdapt
     
     const char* options[] = {"Restart", "Shutdown", "Sleep", "Cancel"};
     const char* icons[] = {"R", "S", "Z", "X"};
-    Color colors[] = {ORANGE, RED, BLUE, GRAY};
+    Color colors[] = {ORANGE, g_theme.danger, BLUE, GRAY};
     
-    if (input.IsMoveLeft()) g_powerMenuFocused = (g_powerMenuFocused - 1 + 4) % 4;
-    if (input.IsMoveRight()) g_powerMenuFocused = (g_powerMenuFocused + 1) % 4;
+    if (input.IsMoveLeft()) { g_powerMenuFocused = (g_powerMenuFocused - 1 + 4) % 4; PlayMoveSound(); }
+    if (input.IsMoveRight()) { g_powerMenuFocused = (g_powerMenuFocused + 1) % 4; PlayMoveSound(); }
     
     if (input.IsBack()) {
         g_currentMode = UIMode::MAIN;
         g_powerMenuSlideIn = 0.0f;
+        PlayBackSound();
         return PowerChoice::CANCEL;
     }
     
     if (input.IsConfirm()) {
         g_currentMode = UIMode::MAIN;
         g_powerMenuSlideIn = 0.0f;
+        PlayConfirmSound();
         return (PowerChoice)g_powerMenuFocused;
     }
     
@@ -1430,8 +1819,8 @@ PowerChoice HandlePowerMenuOverlay(int screenWidth, int screenHeight, InputAdapt
     
     const char* title = "POWER OPTIONS";
     int titleW = MeasureText(title, 36);
-    DrawText(title, screenWidth/2 - titleW/2, screenHeight/2 - 120, 36, Fade(WHITE, slideIn));
-    DrawRectangle(screenWidth/2 - 80, screenHeight/2 - 75, 160, 3, Fade(WHITE, 0.5f * slideIn));
+    DrawText(title, screenWidth/2 - titleW/2, screenHeight/2 - 120, 36, Fade(g_theme.text, slideIn));
+    DrawRectangle(screenWidth/2 - 80, screenHeight/2 - 75, 160, 3, Fade(g_theme.accent, 0.5f * slideIn));
     
     float btnW = 160, btnH = 110, gap = 30;
     float startX = (screenWidth - (btnW * 4 + gap * 3)) / 2;
@@ -1440,11 +1829,11 @@ PowerChoice HandlePowerMenuOverlay(int screenWidth, int screenHeight, InputAdapt
     for (int i = 0; i < 4; i++) {
         float x = startX + i * (btnW + gap);
         bool sel = (i == g_powerMenuFocused);
-        DrawRectangleRounded({x, btnY, btnW, btnH}, 0.15f, 12, Fade(sel ? colors[i] : WHITE, sel ? 0.2f : 0.03f));
+        DrawRectangleRounded({x, btnY, btnW, btnH}, 0.15f, 12, Fade(sel ? colors[i] : g_theme.cardBg, sel ? 0.2f : 0.5f));
         int iconW = MeasureText(icons[i], 40);
         DrawText(icons[i], (int)(x + (btnW - iconW) / 2), (int)(btnY + 25), 40, Fade(colors[i], sel ? 1.0f : 0.5f));
         int labelW = MeasureText(options[i], 18);
-        DrawText(options[i], (int)(x + (btnW - labelW) / 2), (int)(btnY + 75), 18, Fade(WHITE, sel ? 1.0f : 0.6f));
+        DrawText(options[i], (int)(x + (btnW - labelW) / 2), (int)(btnY + 75), 18, Fade(g_theme.text, sel ? 1.0f : 0.6f));
         if (sel) {
             float pulse = (sinf(animTime * 4) + 1) / 2;
             DrawRectangleRoundedLines({x, btnY, btnW, btnH}, 0.15f, 12, Fade(colors[i], 0.5f + pulse * 0.35f));
@@ -1491,15 +1880,10 @@ StartupChoice ShowLaunchDialog() {
         if (input.IsBack()) { CloseWindow(); return StartupChoice::NONE; }
         
         BeginDrawing();
-        for (int i = 0; i < dialogHeight; i++) {
-            float t = (float)i / dialogHeight;
-            Color c = ColorLerp({20, 25, 35, 255}, {12, 14, 20, 255}, t);
-            DrawLine(0, i, dialogWidth, i, c);
-        }
+        ClearBackground({12, 14, 20, 255});
         
         DrawText("Q-SHELL", 40, 35, 48, WHITE);
         DrawText(isCurrentlyShellMode ? "Running as Windows Shell" : "Select Mode", 40, 90, 16, isCurrentlyShellMode ? GREEN : GRAY);
-        DrawRectangle(40, 120, 150, 2, Fade(WHITE, 0.1f));
         
         const char* options[] = {"Normal Application", isCurrentlyShellMode ? "Exit Shell Mode" : "Shell Mode", "Cancel"};
         const char* descs[] = {"Run alongside Explorer", isCurrentlyShellMode ? "Restore Explorer & restart" : "Replace Explorer (restart)", "Close"};
@@ -1512,15 +1896,9 @@ StartupChoice ShowLaunchDialog() {
             if (focused) {
                 float pulse = (sinf(animTime * 4) + 1) / 2;
                 DrawRectangleRoundedLines(btn, 0.15f, 12, Fade(colors[i], 0.4f + pulse * 0.3f));
-                DrawText(">", (int)(btn.x + 15), (int)(btn.y + 18), 24, colors[i]);
             }
-            DrawText(options[i], (int)(btn.x + 40), (int)(btn.y + 12), 20, focused ? colors[i] : Fade(WHITE, 0.7f));
-            DrawText(descs[i], (int)(btn.x + 40), (int)(btn.y + 36), 13, Fade(WHITE, 0.4f));
-        }
-        
-        if (selected == 1 && !isCurrentlyShellMode) {
-            DrawRectangle(0, dialogHeight - 50, dialogWidth, 50, Fade(ORANGE, 0.1f));
-            DrawText("! Requires restart. Emergency restore will be created.", 40, dialogHeight - 32, 13, ORANGE);
+            DrawText(options[i], (int)(btn.x + 20), (int)(btn.y + 12), 20, focused ? colors[i] : Fade(WHITE, 0.7f));
+            DrawText(descs[i], (int)(btn.x + 20), (int)(btn.y + 36), 13, Fade(WHITE, 0.4f));
         }
         EndDrawing();
     }
@@ -1535,7 +1913,6 @@ bool ShowExitShellConfirmation() {
     InitWindow(dialogWidth, dialogHeight, "Exit Shell");
     SetWindowPosition((GetMonitorWidth(0) - dialogWidth) / 2, (GetMonitorHeight(0) - dialogHeight) / 2);
     SetTargetFPS(60);
-    SetForegroundWindow((HWND)GetWindowHandle());
 
     InputAdapter input;
     int selected = 0;
@@ -1554,13 +1931,10 @@ bool ShowExitShellConfirmation() {
         ClearBackground({18, 20, 28, 255});
         DrawText("Exit Shell Mode?", 40, 35, 26, WHITE);
         DrawText("This will restore Windows Explorer and restart.", 40, 75, 14, GRAY);
-        DrawText("Your settings will be preserved.", 40, 100, 13, GREEN);
         
         Rectangle btnYes = {40, 160, 190, 55}, btnNo = {250, 160, 190, 55};
         DrawRectangleRounded(btnYes, 0.25f, 12, selected == 0 ? Fade(GREEN, 0.25f) : Fade(WHITE, 0.05f));
         DrawRectangleRounded(btnNo, 0.25f, 12, selected == 1 ? Fade(RED, 0.25f) : Fade(WHITE, 0.05f));
-        if (selected == 0) DrawRectangleRoundedLines(btnYes, 0.25f, 12, Fade(GREEN, 0.5f + sinf(animTime*4)*0.3f));
-        if (selected == 1) DrawRectangleRoundedLines(btnNo, 0.25f, 12, Fade(RED, 0.5f + sinf(animTime*4)*0.3f));
         DrawText("Yes, Exit", (int)(btnYes.x + 55), (int)(btnYes.y + 18), 18, selected == 0 ? GREEN : WHITE);
         DrawText("Cancel", (int)(btnNo.x + 65), (int)(btnNo.y + 18), 18, selected == 1 ? RED : Fade(WHITE, 0.7f));
         EndDrawing();
@@ -1570,6 +1944,112 @@ bool ShowExitShellConfirmation() {
     return result;
 }
 
+void LoadMediaAppTextures(std::vector<MediaApp>& apps) {
+    for (auto& app : apps) {
+        if (!app.imagePath.empty() && !app.hasTexture) {
+            std::string fullPath = GetFullPath("profile\\" + app.imagePath);
+            if (!fs::exists(fullPath)) fullPath = GetFullPath("img\\" + app.imagePath);
+            if (fs::exists(fullPath)) {
+                app.texture = LoadTexture(fullPath.c_str());
+                app.hasTexture = (app.texture.id > 0);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// BOOT SCREEN
+// ============================================================================
+
+void ShowBootScreen() {
+    DebugLog("ShowBootScreen starting...");
+    
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    if (screenWidth <= 0) screenWidth = 1920;
+    if (screenHeight <= 0) screenHeight = 1080;
+
+    SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST | FLAG_VSYNC_HINT);
+    InitWindow(screenWidth, screenHeight, "Q-Shell Boot");
+    SetWindowPosition(0, 0);
+    SetTargetFPS(60);
+    HideCursor();
+
+    HWND bootHwnd = (HWND)GetWindowHandle();
+    if (bootHwnd) {
+        SetWindowPos(bootHwnd, HWND_TOPMOST, 0, 0, screenWidth, screenHeight, SWP_SHOWWINDOW);
+        SetForegroundWindow(bootHwnd);
+    }
+
+    Texture2D logoTex = {0};
+    bool hasLogo = false;
+    const char* imgPaths[] = { "profile\\intro\\logo.png", "profile\\intro\\intro.png", "img\\logo.png" };
+    
+    for (const char* path : imgPaths) {
+        std::string fullPath = GetFullPath(path);
+        if (fs::exists(fullPath)) {
+            logoTex = LoadTexture(fullPath.c_str());
+            if (logoTex.id > 0) { hasLogo = true; break; }
+        }
+    }
+
+    float elapsed = 0.0f;
+    float duration = 3.5f;
+    float glowPhase = 0.0f;
+
+    while (!WindowShouldClose() && elapsed < duration) {
+        elapsed += GetFrameTime();
+        glowPhase += GetFrameTime() * 2.0f;
+        
+        if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE) || IsKeyPressed(KEY_ESCAPE)) break;
+        for (int i = 0; i < 4; i++) {
+            if (IsGamepadAvailable(i) && (IsGamepadButtonPressed(i, GAMEPAD_BUTTON_RIGHT_FACE_DOWN) ||
+                IsGamepadButtonPressed(i, GAMEPAD_BUTTON_MIDDLE_RIGHT))) {
+                elapsed = duration;
+                break;
+            }
+        }
+        
+        float alpha = 1.0f;
+        if (elapsed < 0.5f) alpha = elapsed / 0.5f;
+        if (elapsed > duration - 0.5f) alpha = (duration - elapsed) / 0.5f;
+        alpha = Clamp(alpha, 0.0f, 1.0f);
+
+        BeginDrawing();
+        ClearBackground(BLACK);
+        
+        if (hasLogo && logoTex.id > 0) {
+            float scale = fminf((float)screenWidth / logoTex.width, (float)screenHeight / logoTex.height) * 0.5f;
+            float x = (screenWidth - logoTex.width * scale) / 2;
+            float y = (screenHeight - logoTex.height * scale) / 2;
+            float glow = (sinf(glowPhase) + 1.0f) / 2.0f * 0.3f;
+            DrawTextureEx(logoTex, {x - 4, y - 4}, 0, scale * 1.02f, Fade(SKYBLUE, alpha * glow));
+            DrawTextureEx(logoTex, {x, y}, 0, scale, Fade(WHITE, alpha));
+        } else {
+            const char* logo = "Q-SHELL";
+            int fontSize = 120;
+            int textW = MeasureText(logo, fontSize);
+            
+            for (int i = 8; i >= 0; i--) {
+                float glowAlpha = alpha * 0.08f * (8 - i) * (0.5f + sinf(glowPhase + i * 0.2f) * 0.5f);
+                DrawText(logo, screenWidth/2 - textW/2 + i*2, screenHeight/2 - fontSize/2 + i*2, fontSize, Fade(SKYBLUE, glowAlpha));
+            }
+            DrawText(logo, screenWidth/2 - textW/2, screenHeight/2 - fontSize/2, fontSize, Fade(WHITE, alpha));
+            
+            const char* sub = "GAMING CONSOLE";
+            int subW = MeasureText(sub, 24);
+            DrawText(sub, screenWidth/2 - subW/2, screenHeight/2 + 70, 24, Fade(GRAY, alpha * 0.8f));
+        }
+        
+        DrawText("v2.6", screenWidth - 60, screenHeight - 30, 16, Fade(GRAY, alpha * 0.3f));
+        EndDrawing();
+    }
+
+    if (hasLogo && logoTex.id > 0) UnloadTexture(logoTex);
+    CloseWindow();
+    DebugLog("Boot screen finished");
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -1577,28 +2057,29 @@ bool ShowExitShellConfirmation() {
 int main(int argc, char* argv[]) {
     SetWorkingDirectoryToExe();
     DebugLog("========================================");
-    DebugLog("Q-Shell v2.5 Starting");
+    DebugLog("Q-Shell v2.6 Starting");
     DebugLog("Directory: " + g_exeDirectory);
 
     SetUnhandledExceptionFilter(CrashHandler);
     fs::create_directories(GetFullPath("img"));
     fs::create_directories(GetFullPath("profile"));
     fs::create_directories(GetFullPath("profile\\intro"));
+    fs::create_directories(GetFullPath("profile\\sounds"));
     fs::create_directories(GetFullPath("backup"));
     CreateEmergencyRestoreBatch();
 
+    // Initialize theme
+    g_theme = g_themes[0];
+    g_targetTheme = g_themes[0];
+
     SystemConfig sysCfg = ReadSystemConfig();
     g_isShellMode = sysCfg.isShellMode || CheckIfShellMode();
-        DebugLog(g_isShellMode ? "MODE: SHELL" : "MODE: NORMAL");
+    DebugLog(g_isShellMode ? "MODE: SHELL" : "MODE: NORMAL");
 
-    // Start global input monitoring
     StartInputMonitoring();
 
-    // Startup
     if (g_isShellMode) {
-        DebugLog("Shell mode - showing boot screen");
         ShowBootScreen();
-        DebugLog("Boot screen complete, terminating explorer");
         TerminateExplorer();
         Sleep(500);
     } else {
@@ -1609,17 +2090,12 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         else if (choice == StartupChoice::SHELL_MODE) {
-            if (!CheckAdminRights()) { 
-                StopInputMonitoring();
-                RequestAdminRights(); 
-                return 0; 
-            }
+            if (!CheckAdminRights()) { StopInputMonitoring(); RequestAdminRights(); return 0; }
             CreateSystemBackup();
-            CreateEmergencyRestoreBatch();
             if (ActivateShellMode()) {
                 sysCfg.isShellMode = true;
                 WriteSystemConfig(sysCfg);
-                MessageBoxA(NULL, "Shell mode activated! Your PC will restart.\n\nEmergency: Run backup\\EMERGENCY_RESTORE.bat from Safe Mode.", "Q-Shell", MB_OK);
+                MessageBoxA(NULL, "Shell mode activated! Your PC will restart.", "Q-Shell", MB_OK);
                 StopInputMonitoring();
                 PerformRestart();
                 return 0;
@@ -1627,16 +2103,11 @@ int main(int argc, char* argv[]) {
         }
         else if (choice == StartupChoice::EXIT_SHELL) {
             if (ShowExitShellConfirmation()) {
-                if (!CheckAdminRights()) { 
-                    StopInputMonitoring();
-                    RequestAdminRights(); 
-                    return 0; 
-                }
+                if (!CheckAdminRights()) { StopInputMonitoring(); RequestAdminRights(); return 0; }
                 DeactivateShellMode();
                 LaunchExplorer();
                 sysCfg.isShellMode = false;
                 WriteSystemConfig(sysCfg);
-                MessageBoxA(NULL, "Shell mode deactivated! Your PC will restart.", "Q-Shell", MB_OK);
                 StopInputMonitoring();
                 PerformRestart();
                 return 0;
@@ -1644,7 +2115,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Main window setup
     int screenWidth = GetSystemMetrics(SM_CXSCREEN);
     int screenHeight = GetSystemMetrics(SM_CYSCREEN);
     if (screenWidth <= 0) screenWidth = 1920;
@@ -1673,7 +2143,6 @@ int main(int argc, char* argv[]) {
         }
         libFile.close();
     }
-    RefreshLibrary(library, currentBgPath, userProfile);
 
     std::vector<MediaApp> mediaApps = {
         {"Google", "https://www.google.com", "google.png", {0}, false, {66, 133, 244, 255}},
@@ -1693,20 +2162,14 @@ int main(int argc, char* argv[]) {
         {"Share to Discord", "Share with friends", {88, 101, 242, 255}},
     };
 
-    // UI State
-    int focused = 0;
-    int barFocused = 0;
+    int focused = 0, barFocused = 0;
     bool inTopBar = false;
-    float scrollY = 0;
-    float mediaScrollX = 0;
+    float scrollY = 0, mediaScrollX = 0;
     int mediaFocusX = 0, mediaFocusY = 0;
     int shareFocused = 0;
     int settingsFocusX = 0, settingsFocusY = 0;
-    bool showDetails = false;
-    bool shouldExit = false;
-
-    bool showDeleteWarning = false;
-    bool isFullUninstall = false;
+    bool showDetails = false, shouldExit = false;
+    bool showDeleteWarning = false, isFullUninstall = false;
     float holdTimer = 0.0f;
     const float HOLD_THRESHOLD = 1.5f;
 
@@ -1719,7 +2182,6 @@ int main(int argc, char* argv[]) {
     const int MENU_COUNT = 4;
     ShellAction pendingShellAction = ShellAction::NONE;
 
-    // Initialize main window
     if (g_isShellMode) {
         SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_FULLSCREEN_MODE | FLAG_VSYNC_HINT);
     } else {
@@ -1729,6 +2191,10 @@ int main(int argc, char* argv[]) {
     InitWindow(screenWidth, screenHeight, "Q-Shell Launcher");
     SetWindowPosition(0, 0);
     SetTargetFPS(60);
+    
+    // Initialize audio AFTER window
+    InitAudioSystem();
+    PlayStartupSound();
     
     g_mainWindow = (HWND)GetWindowHandle();
     
@@ -1742,7 +2208,7 @@ int main(int argc, char* argv[]) {
         g_windowOnTop = false;
     }
     
-    // Load background
+    // Load resources
     if (!currentBgPath.empty() && fs::exists(currentBgPath)) {
         if (IsFileExtension(currentBgPath.c_str(), ".gif")) {
             bgAnimImg = LoadImageAnim(currentBgPath.c_str(), &animFrames);
@@ -1755,30 +2221,32 @@ int main(int argc, char* argv[]) {
     }
     
     LoadMediaAppTextures(mediaApps);
+    LoadProfileAvatar(userProfile);
+    RefreshLibrary(library, currentBgPath, userProfile);
     
-    // Load game posters
     for (auto& game : library) {
         if (!game.hasPoster) {
             std::string path = GetFullPath("img/" + game.info.name + ".png");
             if (!fs::exists(path)) path = GetFullPath("img/" + game.info.name + ".jpg");
             if (fs::exists(path)) {
                 game.poster = LoadTexture(path.c_str());
-                game.hasPoster = (game.poster.id > 0);
-            } else if (!game.info.appId.empty()) {
-                std::string url = "https://cdn.akamai.steamstatic.com/steam/apps/" + game.info.appId + "/library_hero.jpg";
-                std::string dest = GetFullPath("img/" + game.info.name + ".jpg");
-                DownloadFileAsync(url, dest);
+                                game.hasPoster = (game.poster.id > 0);
             }
         }
     }
     
     InputAdapter input;
-
     DebugLog("Entering main loop...");
 
     while (!WindowShouldClose() && !shouldExit) {
         float deltaTime = GetFrameTime();
         float currentTime = (float)GetTime();
+        
+        // Update theme transition
+        UpdateThemeTransition();
+        
+        // Update background music
+        UpdateBackgroundMusic();
         
         // Check for global task switcher request
         if (g_taskSwitcherRequested.exchange(false)) {
@@ -1789,14 +2257,23 @@ int main(int argc, char* argv[]) {
             g_taskSwitcherAnimTime = 0.0f;
             
             if (g_mainWindow) {
-                if (g_isShellMode) {
-                    MakeQShellTopmost();
-                } else {
-                    ShowWindow(g_mainWindow, SW_RESTORE);
-                    SetForegroundWindow(g_mainWindow);
-                }
+                ShowWindow(g_mainWindow, SW_RESTORE);
+                ShowWindow(g_mainWindow, SW_SHOW);
+                SetWindowPos(g_mainWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                SetForegroundWindow(g_mainWindow);
+                BringWindowToTop(g_mainWindow);
+                
+                DWORD currentThread = GetCurrentThreadId();
+                DWORD foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
+                AttachThreadInput(currentThread, foregroundThread, TRUE);
+                SetForegroundWindow(g_mainWindow);
+                SetFocus(g_mainWindow);
+                AttachThreadInput(currentThread, foregroundThread, FALSE);
+                
+                g_windowOnTop = true;
             }
             g_currentMode = UIMode::TASK_SWITCHER;
+            PlayNotifySound();
         }
         
         input.Update();
@@ -1818,6 +2295,7 @@ int main(int argc, char* argv[]) {
             switch (pendingShellAction) {
                 case ShellAction::EXPLORER:
                     LaunchExplorer();
+                    ShowNotification("Explorer", "File Explorer opened", 0);
                     break;
                 case ShellAction::KEYBOARD:
                     ShellExecuteA(NULL, "open", "osk.exe", NULL, NULL, SW_SHOWNORMAL);
@@ -1840,6 +2318,7 @@ int main(int argc, char* argv[]) {
                             sysCfg.isShellMode = false;
                             WriteSystemConfig(sysCfg);
                             StopInputMonitoring();
+                            CleanupAudioSystem();
                             PerformRestart();
                             shouldExit = true;
                         }
@@ -1855,24 +2334,26 @@ int main(int argc, char* argv[]) {
             pendingShellAction = ShellAction::NONE;
         }
         
-        // Handle overlays based on current mode
+        // ================================================================
+        // HANDLE OVERLAY MODES
+        // ================================================================
+        
         if (g_currentMode == UIMode::TASK_SWITCHER) {
             BeginDrawing();
-            // Draw main UI dimmed in background
-            ClearBackground({12, 12, 15, 255});
+            ClearBackground(g_theme.primary);
             if (bgTexture.id > 0) {
                 DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
                     {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, Fade(WHITE, 0.3f));
             }
-            // Draw task switcher overlay
             HandleTaskSwitcherOverlay(screenWidth, screenHeight, input, deltaTime);
+            UpdateAndDrawNotifications(screenWidth, deltaTime);
             EndDrawing();
             continue;
         }
         
         if (g_currentMode == UIMode::SHELL_MENU) {
             BeginDrawing();
-            ClearBackground({12, 12, 15, 255});
+            ClearBackground(g_theme.primary);
             if (bgTexture.id > 0) {
                 DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
                     {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, Fade(WHITE, 0.3f));
@@ -1881,13 +2362,14 @@ int main(int argc, char* argv[]) {
             if (action != ShellAction::NONE) {
                 pendingShellAction = action;
             }
+            UpdateAndDrawNotifications(screenWidth, deltaTime);
             EndDrawing();
             continue;
         }
         
         if (g_currentMode == UIMode::POWER_MENU) {
             BeginDrawing();
-            ClearBackground({12, 12, 15, 255});
+            ClearBackground(g_theme.primary);
             if (bgTexture.id > 0) {
                 DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
                     {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, Fade(WHITE, 0.3f));
@@ -1895,12 +2377,14 @@ int main(int argc, char* argv[]) {
             PowerChoice pwr = HandlePowerMenuOverlay(screenWidth, screenHeight, input, deltaTime);
             if (pwr == PowerChoice::RESTART) { 
                 StopInputMonitoring();
+                CleanupAudioSystem();
                 LaunchExplorer(); 
                 PerformRestart(); 
                 shouldExit = true; 
             }
             else if (pwr == PowerChoice::SHUTDOWN) { 
                 StopInputMonitoring();
+                CleanupAudioSystem();
                 LaunchExplorer(); 
                 PerformShutdown(); 
                 shouldExit = true; 
@@ -1912,11 +2396,40 @@ int main(int argc, char* argv[]) {
             else if (pwr == PowerChoice::CANCEL) {
                 g_currentMode = UIMode::MAIN;
             }
+            UpdateAndDrawNotifications(screenWidth, deltaTime);
             EndDrawing();
             continue;
         }
         
-        // === MAIN UI MODE ===
+        if (g_currentMode == UIMode::PROFILE_EDIT) {
+            BeginDrawing();
+            ClearBackground(g_theme.primary);
+            if (bgTexture.id > 0) {
+                DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
+                    {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, Fade(WHITE, 0.2f));
+            }
+            HandleProfileEditOverlay(screenWidth, screenHeight, input, deltaTime, userProfile, library, currentBgPath);
+            UpdateAndDrawNotifications(screenWidth, deltaTime);
+            EndDrawing();
+            continue;
+        }
+        
+        if (g_currentMode == UIMode::THEME_SELECT) {
+            BeginDrawing();
+            ClearBackground(g_theme.primary);
+            if (bgTexture.id > 0) {
+                DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
+                    {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, Fade(WHITE, 0.15f));
+            }
+            HandleThemeSelectOverlay(screenWidth, screenHeight, input, deltaTime, userProfile);
+            UpdateAndDrawNotifications(screenWidth, deltaTime);
+            EndDrawing();
+            continue;
+        }
+        
+        // ================================================================
+        // MAIN UI MODE INPUT HANDLING
+        // ================================================================
         
         // Background shortcut (B key)
         if (input.IsBackgroundKey() && !showDeleteWarning) {
@@ -1934,16 +2447,18 @@ int main(int argc, char* argv[]) {
                     isAnimatedBG = false;
                 }
                 SaveProfile(library, currentBgPath, userProfile);
+                ShowNotification("Background Changed", "New wallpaper set", 1);
             }
         }
         
-        // View = Task Switcher
+        // View = Task Switcher (F2 or View button)
         if (input.IsView()) {
             RefreshTaskList();
             g_taskFocusIndex = 0;
             g_taskSwitcherSlideIn = 0.0f;
             g_taskSwitcherAnimTime = 0.0f;
             g_currentMode = UIMode::TASK_SWITCHER;
+            PlayConfirmSound();
         }
         
         // Menu = Shell Menu (in shell mode)
@@ -1951,6 +2466,7 @@ int main(int argc, char* argv[]) {
             g_shellMenuFocused = 0;
             g_shellMenuSlideIn = 0.0f;
             g_currentMode = UIMode::SHELL_MENU;
+            PlayConfirmSound();
         }
         
         // Tab switching with LB/RB
@@ -1960,12 +2476,14 @@ int main(int argc, char* argv[]) {
                 focused = 0; mediaFocusX = mediaFocusY = 0; shareFocused = 0; settingsFocusX = settingsFocusY = 0;
                 inTopBar = false; showDetails = false;
                 transAlpha = 0.2f;
+                PlayMoveSound();
             }
             if (input.IsRB()) {
                 barFocused = (barFocused + 1) % MENU_COUNT;
                 focused = 0; mediaFocusX = mediaFocusY = 0; shareFocused = 0; settingsFocusX = settingsFocusY = 0;
                 inTopBar = false; showDetails = false;
                 transAlpha = 0.2f;
+                PlayMoveSound();
             }
         }
         
@@ -1974,34 +2492,51 @@ int main(int argc, char* argv[]) {
             if (input.IsConfirm()) {
                 if (isFullUninstall) PhysicallyUninstall(library[focused]);
                 if (library[focused].hasPoster) UnloadTexture(library[focused].poster);
+                std::string gameName = library[focused].info.name;
                 library.erase(library.begin() + focused);
                 SaveProfile(library, currentBgPath, userProfile);
                 showDeleteWarning = false;
                 focused = Clamp(focused - 1, 0, std::max(0, (int)library.size() - 1));
+                PlayConfirmSound();
+                ShowNotification("Game Removed", gameName + " removed from library", 3);
             }
-            if (input.IsBack()) showDeleteWarning = false;
+            if (input.IsBack()) {
+                showDeleteWarning = false;
+                PlayBackSound();
+            }
         }
-        // Navigation
+        // Navigation (Top Bar)
         else if (inTopBar) {
             if (input.IsMoveDown()) {
                 inTopBar = false;
                 if (barFocused == 0) RefreshLibrary(library, currentBgPath, userProfile);
+                PlayMoveSound();
             }
-            if (input.IsMoveRight()) { barFocused = (barFocused + 1) % MENU_COUNT; transAlpha = 0.1f; }
-            if (input.IsMoveLeft()) { barFocused = (barFocused + MENU_COUNT - 1) % MENU_COUNT; transAlpha = 0.1f; }
+            if (input.IsMoveRight()) { 
+                barFocused = (barFocused + 1) % MENU_COUNT; 
+                transAlpha = 0.1f; 
+                PlayMoveSound();
+            }
+            if (input.IsMoveLeft()) { 
+                barFocused = (barFocused + MENU_COUNT - 1) % MENU_COUNT; 
+                transAlpha = 0.1f; 
+                PlayMoveSound();
+            }
         }
+        // Navigation (Content)
         else {
             if (barFocused == 0) {
-                // Library
-                if (input.IsMoveDown()) { focused++; showDetails = false; }
+                // LIBRARY
+                if (input.IsMoveDown()) { focused++; showDetails = false; PlayMoveSound(); }
                 if (input.IsMoveUp()) {
                     if (focused == 0) inTopBar = true;
                     else { focused--; showDetails = false; }
+                    PlayMoveSound();
                 }
                 focused = Clamp(focused, 0, totalItems - 1);
                 
-                if (input.IsMoveRight() && focused < (int)library.size()) showDetails = true;
-                if (input.IsMoveLeft()) showDetails = false;
+                if (input.IsMoveRight() && focused < (int)library.size()) { showDetails = true; PlayMoveSound(); }
+                if (input.IsMoveLeft()) { showDetails = false; PlayMoveSound(); }
                 
                 if (focused < (int)library.size()) {
                     if (input.IsChangeArt()) {
@@ -2013,6 +2548,7 @@ int main(int argc, char* argv[]) {
                             library[focused].poster = LoadTexture(target.c_str());
                             library[focused].hasPoster = (library[focused].poster.id > 0);
                             SaveProfile(library, currentBgPath, userProfile);
+                            ShowNotification("Art Updated", library[focused].info.name, 1);
                         }
                     }
                     
@@ -2022,19 +2558,23 @@ int main(int argc, char* argv[]) {
                             showDeleteWarning = true;
                             isFullUninstall = true;
                             holdTimer = 0;
+                            PlayErrorSound();
                         }
                     }
                     if (input.IsDeleteReleased()) {
                         if (holdTimer > 0.1f && holdTimer < HOLD_THRESHOLD) {
                             showDeleteWarning = true;
                             isFullUninstall = false;
+                            PlayBackSound();
                         }
                         holdTimer = 0;
                     }
                 }
                 
                 if (input.IsConfirm() && !showDeleteWarning) {
+                    PlayConfirmSound();
                     if (focused < (int)library.size()) {
+                        ShowNotification("Launching", library[focused].info.name, 0);
                         LaunchGame(library[focused].info.exePath);
                     } else {
                         std::string path = OpenFilePicker(true);
@@ -2044,22 +2584,24 @@ int main(int argc, char* argv[]) {
                             library.push_back({manualGame, {0}, false, 0.0f, 0.0f});
                             SaveProfile(library, currentBgPath, userProfile);
                             focused = (int)library.size() - 1;
+                            ShowNotification("Game Added", manualGame.name, 1);
                         }
                     }
                 }
             }
             else if (barFocused == 1) {
-                // Media
+                // MEDIA
                 int cols = 4;
                 int rows = ((int)mediaApps.size() + cols - 1) / cols;
                 
                 if (input.IsMoveUp()) {
                     if (mediaFocusY == 0) inTopBar = true;
                     else mediaFocusY--;
+                    PlayMoveSound();
                 }
-                if (input.IsMoveDown()) mediaFocusY = std::min(mediaFocusY + 1, rows - 1);
-                if (input.IsMoveLeft()) mediaFocusX = std::max(mediaFocusX - 1, 0);
-                if (input.IsMoveRight()) mediaFocusX = std::min(mediaFocusX + 1, cols - 1);
+                if (input.IsMoveDown()) { mediaFocusY = std::min(mediaFocusY + 1, rows - 1); PlayMoveSound(); }
+                if (input.IsMoveLeft()) { mediaFocusX = std::max(mediaFocusX - 1, 0); PlayMoveSound(); }
+                if (input.IsMoveRight()) { mediaFocusX = std::min(mediaFocusX + 1, cols - 1); PlayMoveSound(); }
                 
                 int maxIdx = (int)mediaApps.size() - 1;
                 int currentIdx = mediaFocusY * cols + mediaFocusX;
@@ -2069,35 +2611,42 @@ int main(int argc, char* argv[]) {
                 }
                 
                 if (input.IsConfirm()) {
+                    PlayConfirmSound();
                     int idx = mediaFocusY * cols + mediaFocusX;
                     if (idx < (int)mediaApps.size()) {
+                        ShowNotification("Opening", mediaApps[idx].name, 0);
                         OpenURL(mediaApps[idx].url);
                     }
                 }
             }
             else if (barFocused == 2) {
-                // Share
+                // SHARE
                 if (input.IsMoveUp()) {
                     if (shareFocused == 0) inTopBar = true;
                     else shareFocused--;
+                    PlayMoveSound();
                 }
-                if (input.IsMoveDown()) shareFocused = std::min(shareFocused + 1, (int)shareOptions.size() - 1);
+                if (input.IsMoveDown()) { shareFocused = std::min(shareFocused + 1, (int)shareOptions.size() - 1); PlayMoveSound(); }
                 
                 if (input.IsConfirm()) {
+                    PlayConfirmSound();
+                    ShowNotification(shareOptions[shareFocused].name, "Feature coming soon", 2);
                     DebugLog("Share action: " + shareOptions[shareFocused].name);
                 }
             }
             else if (barFocused == 3) {
-                // Settings
+                // SETTINGS
                 if (input.IsMoveUp()) {
                     if (settingsFocusY == 0) inTopBar = true;
                     else settingsFocusY--;
+                    PlayMoveSound();
                 }
-                if (input.IsMoveDown()) settingsFocusY = std::min(settingsFocusY + 1, 1);
-                if (input.IsMoveLeft()) settingsFocusX = std::max(settingsFocusX - 1, 0);
-                if (input.IsMoveRight()) settingsFocusX = std::min(settingsFocusX + 1, 2);
+                if (input.IsMoveDown()) { settingsFocusY = std::min(settingsFocusY + 1, 1); PlayMoveSound(); }
+                if (input.IsMoveLeft()) { settingsFocusX = std::max(settingsFocusX - 1, 0); PlayMoveSound(); }
+                if (input.IsMoveRight()) { settingsFocusX = std::min(settingsFocusX + 1, 2); PlayMoveSound(); }
                 
                 if (input.IsConfirm()) {
+                    PlayConfirmSound();
                     int idx = settingsFocusY * 3 + settingsFocusX;
                     switch (idx) {
                         case 0: { // Background
@@ -2115,18 +2664,32 @@ int main(int argc, char* argv[]) {
                                     isAnimatedBG = false;
                                 }
                                 SaveProfile(library, currentBgPath, userProfile);
+                                ShowNotification("Background Changed", "New wallpaper applied", 1);
                             }
                         } break;
-                        case 2: RefreshLibrary(library, currentBgPath, userProfile); break;
-                        case 3: {
+                        case 1: // Profile
+                            g_profileEditFocus = 0;
+                            g_profileEditSlide = 0.0f;
+                            g_currentMode = UIMode::PROFILE_EDIT;
+                            break;
+                        case 2: // Refresh
+                            RefreshLibrary(library, currentBgPath, userProfile);
+                            break;
+                        case 3: { // Reset BG
                             if (bgTexture.id > 0) UnloadTexture(bgTexture);
                             if (isAnimatedBG && bgAnimImg.data) UnloadImage(bgAnimImg);
                             currentBgPath = "";
                             bgTexture = {0};
                             isAnimatedBG = false;
                             SaveProfile(library, currentBgPath, userProfile);
+                            ShowNotification("Background Reset", "Default background restored", 1);
                         } break;
-                        case 5: shouldExit = true; break;
+                        case 4: // About
+                            ShowNotification("Q-Shell v2.6", "Custom gaming shell for Windows", 0);
+                            break;
+                        case 5: // Exit
+                            shouldExit = true;
+                            break;
                     }
                 }
             }
@@ -2149,37 +2712,20 @@ int main(int argc, char* argv[]) {
         // ================================================================
         
         BeginDrawing();
-        ClearBackground({12, 12, 15, 255});
+        ClearBackground(g_theme.primary);
         
         // Background
         if (bgTexture.id > 0) {
             DrawTexturePro(bgTexture, {0, 0, (float)bgTexture.width, (float)bgTexture.height},
                 {0, 0, (float)screenWidth, (float)screenHeight}, {0, 0}, 0, WHITE);
-            DrawRectangle(0, 0, screenWidth, screenHeight, {12, 12, 15, 200});
+            DrawRectangle(0, 0, screenWidth, screenHeight, Fade(g_theme.primary, 0.75f));
         } else {
-            DrawCircleGradient(screenWidth/2, screenHeight/2, 800, {22, 22, 28, 255}, {12, 12, 15, 255});
+            DrawCircleGradient(screenWidth/2, screenHeight/2, 800, 
+                ColorBrightness(g_theme.secondary, 0.1f), g_theme.primary);
         }
-        
-        // Top bar
+
+        // Prepare top bar variables
         float topBarY = 60;
-        DrawRectangle(0, 0, screenWidth, 110, Fade(BLACK, 0.4f));
-        DrawRectangle(0, 109, screenWidth, 1, Fade(WHITE, 0.05f));
-        
-        // Avatar
-        DrawCircularAvatar({55, topBarY + 5}, 25, userProfile.avatar, userProfile.hasAvatar, userProfile.username);
-        DrawText(userProfile.username.c_str(), 90, (int)(topBarY - 5), 18, WHITE);
-        
-        // Menu tabs
-        const char* menuItems[] = {"LIBRARY", "MEDIA", "SHARE", "SETTINGS"};
-        float menuStartX = (screenWidth - (MENU_COUNT * 180)) / 2;
-        for (int m = 0; m < MENU_COUNT; m++) {
-            bool isSelected = (barFocused == m);
-            Color mCol = isSelected ? WHITE : Fade(GRAY, 0.4f);
-            DrawText(menuItems[m], (int)(menuStartX + (m * 180)), (int)topBarY, 22, mCol);
-            if (isSelected) DrawRectangle((int)(menuStartX + (m * 180)), (int)(topBarY + 35), 30, 3, WHITE);
-        }
-        
-        // Battery & Time
         SYSTEM_POWER_STATUS sps;
         GetSystemPowerStatus(&sps);
         int batteryPct = (sps.BatteryLifePercent <= 100) ? sps.BatteryLifePercent : 100;
@@ -2187,25 +2733,15 @@ int main(int argc, char* argv[]) {
         struct tm* ltm = localtime(&now);
         char timeBuf[16];
         strftime(timeBuf, sizeof(timeBuf), "%H:%M", ltm);
-        
-        DrawRectangleLines(screenWidth - 300, (int)(topBarY + 4), 35, 18, Fade(WHITE, 0.6f));
-        DrawRectangle(screenWidth - 298, (int)(topBarY + 6), (int)(31.0f * batteryPct / 100.0f), 14, (batteryPct < 20) ? RED : GREEN);
-        DrawText(TextFormat("%d%%", batteryPct), screenWidth - 255, (int)(topBarY + 4), 18, WHITE);
-        DrawText(timeBuf, screenWidth - 120, (int)topBarY, 26, WHITE);
-        
-        if (g_isShellMode) {
-            DrawRectangleRounded({(float)(screenWidth - 200), topBarY - 5, 70, 22}, 0.5f, 8, Fade(GREEN, 0.2f));
-            DrawText("SHELL", screenWidth - 190, (int)(topBarY - 1), 12, GREEN);
-        }
-        
-        // Content
         float contentTop = 120;
+
+        // DRAW CONTENT FIRST (scrolls behind bars)
         
         if (barFocused == 0) {
             // LIBRARY
             for (int i = 0; i < totalItems; i++) {
                 float itemY = scrollY + (i * 320);
-                if (itemY < -400 || itemY > screenHeight + 400) continue;
+                if (itemY < -300 || itemY > screenHeight) continue;
                 
                 float alpha = (!inTopBar && i == focused) ? 1.0f : 0.25f;
                 if (inTopBar) alpha = 0.15f;
@@ -2218,32 +2754,34 @@ int main(int argc, char* argv[]) {
                     if (game.detailAlpha > 0.01f) {
                         float dAlpha = game.detailAlpha;
                         Rectangle dBox = {card.x + card.width + 40, card.y, 600 * dAlpha, card.height};
-                        DrawRectangleRounded(dBox, 0.05f, 12, Fade({25, 25, 30, 255}, dAlpha));
+                        DrawRectangleRounded(dBox, 0.05f, 12, Fade(g_theme.secondary, dAlpha * 0.9f));
                         if (dAlpha > 0.8f) {
-                            DrawText("STATUS", (int)(dBox.x + 40), (int)(dBox.y + 35), 16, Fade(GRAY, dAlpha));
-                            DrawText("READY TO PLAY", (int)(dBox.x + 40), (int)(dBox.y + 55), 24, Fade(GREEN, dAlpha));
-                            DrawText("PLATFORM", (int)(dBox.x + 40), (int)(dBox.y + 115), 16, Fade(GRAY, dAlpha));
-                            DrawText(game.info.platform.c_str(), (int)(dBox.x + 40), (int)(dBox.y + 135), 22, Fade(WHITE, dAlpha));
+                            DrawText("STATUS", (int)(dBox.x + 40), (int)(dBox.y + 35), 16, Fade(g_theme.textDim, dAlpha));
+                            DrawText("READY TO PLAY", (int)(dBox.x + 40), (int)(dBox.y + 55), 24, Fade(g_theme.success, dAlpha));
+                            DrawText("PLATFORM", (int)(dBox.x + 40), (int)(dBox.y + 115), 16, Fade(g_theme.textDim, dAlpha));
+                            DrawText(game.info.platform.c_str(), (int)(dBox.x + 40), (int)(dBox.y + 135), 22, Fade(g_theme.text, dAlpha));
+                            DrawText("[A] LAUNCH", (int)(dBox.x + 40), (int)(dBox.y + 200), 18, Fade(g_theme.accent, dAlpha));
                         }
                     }
                     
                     DrawGameCard(card, game, isFocused, currentTime);
                     
                     if (isFocused && !showDetails) {
-                        DrawText(game.info.name.c_str(), (int)(card.x + card.width + 50), (int)(itemY + 90), 40, Fade(WHITE, alpha));
+                        DrawText(game.info.name.c_str(), (int)(card.x + card.width + 50), (int)(itemY + 90), 40, Fade(g_theme.text, alpha));
+                        DrawText(game.info.platform.c_str(), (int)(card.x + card.width + 50), (int)(itemY + 140), 18, Fade(g_theme.textDim, alpha * 0.7f));
                         if (holdTimer > 0) {
-                            DrawRectangle((int)(card.x + card.width + 50), (int)(itemY + 145), (int)((holdTimer / HOLD_THRESHOLD) * 200), 4, RED);
+                            DrawRectangle((int)(card.x + card.width + 50), (int)(itemY + 170), (int)((holdTimer / HOLD_THRESHOLD) * 200), 4, g_theme.danger);
                         }
                     }
                 } else {
-                    DrawRectangleRounded(card, 0.05f, 12, Fade({45, 45, 50, 255}, alpha));
-                    DrawText("+", (int)(card.x + card.width/2 - 20), (int)(card.y + card.height/2 - 40), 80, Fade(WHITE, alpha));
-                    DrawText("Add Game", (int)(card.x + card.width/2 - 45), (int)(card.y + card.height/2 + 35), 16, Fade(WHITE, alpha * 0.6f));
+                    DrawRectangleRounded(card, 0.05f, 12, Fade(g_theme.cardBg, alpha));
+                    DrawText("+", (int)(card.x + card.width/2 - 20), (int)(card.y + card.height/2 - 40), 80, Fade(g_theme.text, alpha));
+                    DrawText("Add Game", (int)(card.x + card.width/2 - 45), (int)(card.y + card.height/2 + 35), 16, Fade(g_theme.textDim, alpha * 0.6f));
                 }
                 
                 if (!inTopBar && i == focused) {
                     float pulse = (sinf(currentTime * 4) + 1) / 2;
-                    DrawRectangleRoundedLinesEx(card, 0.05f, 12, 4.0f, Fade(WHITE, 0.4f + pulse * 0.4f));
+                    DrawRectangleRoundedLinesEx(card, 0.05f, 12, 4.0f, Fade(g_theme.accent, 0.4f + pulse * 0.4f));
                 }
             }
         }
@@ -2272,14 +2810,14 @@ int main(int argc, char* argv[]) {
             float startY = contentTop + 50;
             float optionW = 500, optionH = 80, gap = 20;
             
-            DrawText("SHARE & CAPTURE", (int)(centerX - 120), (int)(startY), 28, WHITE);
-            DrawRectangle((int)(centerX - 120), (int)(startY + 40), 100, 3, SKYBLUE);
+            DrawText("SHARE & CAPTURE", (int)(centerX - 120), (int)(startY), 28, g_theme.text);
+            DrawRectangle((int)(centerX - 120), (int)(startY + 40), 100, 3, g_theme.accent);
             
             for (int i = 0; i < (int)shareOptions.size(); i++) {
                 Rectangle optRect = {centerX - optionW/2, startY + 70 + i * (optionH + gap), optionW, optionH};
                 bool isFocused = (!inTopBar && shareFocused == i);
                 
-                DrawRectangleRounded(optRect, 0.15f, 12, isFocused ? Fade(shareOptions[i].accentColor, 0.15f) : Fade(WHITE, 0.03f));
+                DrawRectangleRounded(optRect, 0.15f, 12, isFocused ? Fade(shareOptions[i].accentColor, 0.15f) : Fade(g_theme.cardBg, 0.5f));
                 if (isFocused) {
                     float pulse = (sinf(currentTime * 4) + 1) / 2;
                     DrawRectangleRoundedLines(optRect, 0.15f, 12, Fade(shareOptions[i].accentColor, 0.4f + pulse * 0.3f));
@@ -2292,8 +2830,8 @@ int main(int argc, char* argv[]) {
                 DrawText(iconStr, (int)(optRect.x + 50 - iconW/2), (int)(optRect.y + optRect.height/2 - 12), 24, 
                     isFocused ? shareOptions[i].accentColor : Fade(shareOptions[i].accentColor, 0.5f));
                 DrawText(shareOptions[i].name.c_str(), (int)(optRect.x + 100), (int)(optRect.y + 18), 20, 
-                    isFocused ? WHITE : Fade(WHITE, 0.7f));
-                DrawText(shareOptions[i].description.c_str(), (int)(optRect.x + 100), (int)(optRect.y + 45), 14, Fade(WHITE, 0.4f));
+                    isFocused ? g_theme.text : g_theme.textDim);
+                DrawText(shareOptions[i].description.c_str(), (int)(optRect.x + 100), (int)(optRect.y + 45), 14, Fade(g_theme.textDim, 0.7f));
             }
         }
         else if (barFocused == 3) {
@@ -2304,12 +2842,12 @@ int main(int argc, char* argv[]) {
             
             struct Setting { const char* icon; const char* title; Color accent; };
             Setting items[] = {
-                {"B", "Background", SKYBLUE},
+                {"B", "Background", g_theme.accent},
                 {"P", "Profile", PURPLE},
-                {"R", "Refresh", GREEN},
+                {"R", "Refresh", g_theme.success},
                 {"X", "Reset BG", ORANGE},
                 {"?", "About", GRAY},
-                {"Q", "Exit", RED}
+                {"Q", "Exit", g_theme.danger}
             };
             
             int focusIdx = settingsFocusY * 3 + settingsFocusX;
@@ -2323,39 +2861,71 @@ int main(int argc, char* argv[]) {
             }
             
             float infoY = startY + 2 * (tileH + gap) + 30;
-            DrawText("Mode:", 50, (int)infoY, 15, Fade(WHITE, 0.4f));
-            DrawText(g_isShellMode ? "SHELL" : "Normal", 100, (int)infoY, 15, g_isShellMode ? GREEN : SKYBLUE);
-            DrawText("Games:", 50, (int)(infoY + 25), 15, Fade(WHITE, 0.4f));
-            DrawText(TextFormat("%d", (int)library.size()), 115, (int)(infoY + 25), 15, SKYBLUE);
+            DrawText("Mode:", 50, (int)infoY, 15, g_theme.textDim);
+            DrawText(g_isShellMode ? "SHELL" : "Normal", 100, (int)infoY, 15, g_isShellMode ? g_theme.success : g_theme.accent);
+            DrawText("Games:", 50, (int)(infoY + 25), 15, g_theme.textDim);
+            DrawText(TextFormat("%d", (int)library.size()), 115, (int)(infoY + 25), 15, g_theme.accent);
+            DrawText("Theme:", 50, (int)(infoY + 50), 15, g_theme.textDim);
+            DrawText(g_theme.name.c_str(), 115, (int)(infoY + 50), 15, g_theme.accent);
+        }
+
+        // TOP BAR (Covers content)
+        DrawRectangle(0, 0, screenWidth, 110, Fade(BLACK, 0.85f));
+        DrawRectangle(0, 109, screenWidth, 1, Fade(g_theme.accent, 0.1f));
+        
+        // Avatar
+        DrawCircularAvatar({55, topBarY + 5}, 25, userProfile.avatar, userProfile.hasAvatar, userProfile.username);
+        DrawText(userProfile.username.c_str(), 90, (int)(topBarY - 5), 18, g_theme.text);
+        
+        // Menu tabs
+        const char* menuItems[] = {"LIBRARY", "MEDIA", "SHARE", "SETTINGS"};
+        float menuStartX = (screenWidth - (MENU_COUNT * 180)) / 2;
+        for (int m = 0; m < MENU_COUNT; m++) {
+            bool isSelected = (barFocused == m);
+            Color mCol = isSelected ? g_theme.text : g_theme.textDim;
+            DrawText(menuItems[m], (int)(menuStartX + (m * 180)), (int)topBarY, 22, mCol);
+            if (isSelected) DrawRectangle((int)(menuStartX + (m * 180)), (int)(topBarY + 35), 30, 3, g_theme.accent);
+        }
+        
+        // Battery & Time
+        DrawRectangleLines(screenWidth - 300, (int)(topBarY + 4), 35, 18, Fade(g_theme.text, 0.6f));
+        Color battColor = (batteryPct < 20) ? g_theme.danger : g_theme.success;
+        DrawRectangle(screenWidth - 298, (int)(topBarY + 6), (int)(31.0f * batteryPct / 100.0f), 14, battColor);
+        DrawText(TextFormat("%d%%", batteryPct), screenWidth - 255, (int)(topBarY + 4), 18, g_theme.text);
+        DrawText(timeBuf, screenWidth - 120, (int)topBarY, 26, g_theme.text);
+        
+        if (g_isShellMode) {
+            DrawRectangleRounded({(float)(screenWidth - 200), topBarY - 5, 70, 22}, 0.5f, 8, Fade(g_theme.success, 0.2f));
+            DrawText("SHELL", screenWidth - 190, (int)(topBarY - 1), 12, g_theme.success);
         }
         
         // Delete warning overlay
         if (showDeleteWarning) {
             DrawRectangle(0, 0, screenWidth, screenHeight, Fade(BLACK, 0.8f));
             Rectangle box = {(float)(screenWidth/2 - 300), (float)(screenHeight/2 - 150), 600, 300};
-            DrawRectangleRounded(box, 0.1f, 10, {40, 40, 45, 255});
-            DrawRectangleRoundedLinesEx(box, 0.1f, 10, 2, isFullUninstall ? RED : YELLOW);
-            DrawText(isFullUninstall ? "FULL UNINSTALL" : "REMOVE FROM LIST", (int)(box.x + 150), (int)(box.y + 50), 28, isFullUninstall ? RED : YELLOW);
-            DrawText("Confirm with [A] or [B] to cancel", (int)(box.x + 120), (int)(box.y + 150), 20, WHITE);
+            DrawRectangleRounded(box, 0.1f, 10, g_theme.secondary);
+            DrawRectangleRoundedLinesEx(box, 0.1f, 10, 2, isFullUninstall ? g_theme.danger : g_theme.warning);
+            DrawText(isFullUninstall ? "FULL UNINSTALL" : "REMOVE FROM LIST", (int)(box.x + 150), (int)(box.y + 50), 28, isFullUninstall ? g_theme.danger : g_theme.warning);
+            DrawText("Confirm with [A] or [B] to cancel", (int)(box.x + 120), (int)(box.y + 150), 20, g_theme.text);
             if (isFullUninstall) {
-                DrawText("This will delete game files!", (int)(box.x + 140), (int)(box.y + 200), 16, RED);
+                DrawText("This will delete game files!", (int)(box.x + 140), (int)(box.y + 200), 16, g_theme.danger);
             }
         }
         
-        // Bottom bar
+        // BOTTOM BAR
         float hintY = screenHeight - 70;
-        DrawRectangle(0, (int)hintY, screenWidth, 70, Fade(BLACK, 0.5f));
-        DrawRectangle(0, (int)hintY, screenWidth, 1, Fade(WHITE, 0.1f));
+        DrawRectangle(0, (int)hintY, screenWidth, 70, Fade(BLACK, 0.85f));
+        DrawRectangle(0, (int)hintY, screenWidth, 1, Fade(g_theme.accent, 0.1f));
         
         DrawRectangleRounded({30, hintY + 12, 280, 45}, 0.5f, 10, Fade(PURPLE, 0.15f));
         DrawRectangleRoundedLines({30, hintY + 12, 280, 45}, 0.5f, 10, Fade(PURPLE, 0.3f));
-        DrawText("TAB+O / SHARE+X: Task Switcher", 50, (int)(hintY + 26), 14, Fade(WHITE, 0.8f));
+        DrawText("TAB+O / SHARE+X: Task Switcher", 50, (int)(hintY + 26), 14, Fade(g_theme.text, 0.8f));
         
         float pulse = (sinf(currentTime * 4) + 1.0f) / 2.0f;
         Rectangle btnRect = {(float)(screenWidth - 280), hintY + 12, 250, 45};
-        DrawRectangleRounded(btnRect, 0.5f, 10, Fade(SKYBLUE, 0.1f + pulse * 0.1f));
-        DrawRectangleRoundedLinesEx(btnRect, 0.5f, 10, 2, Fade(WHITE, 0.3f + pulse * 0.4f));
-        DrawText("[B] SET BACKGROUND", (int)(btnRect.x + 40), (int)(btnRect.y + 15), 14, WHITE);
+        DrawRectangleRounded(btnRect, 0.5f, 10, Fade(g_theme.accent, 0.1f + pulse * 0.1f));
+        DrawRectangleRoundedLinesEx(btnRect, 0.5f, 10, 2, Fade(g_theme.accent, 0.3f + pulse * 0.4f));
+        DrawText("[B] SET BACKGROUND", (int)(btnRect.x + 40), (int)(btnRect.y + 15), 14, g_theme.text);
         
         const char* centerHint = "";
         if (barFocused == 0) centerHint = "[A] Launch  |  [Y] Art  |  [X] Delete  |  [LB/RB] Tabs";
@@ -2363,16 +2933,24 @@ int main(int argc, char* argv[]) {
         else if (barFocused == 2) centerHint = "[A] Action  |  [LB/RB] Tabs";
         else if (barFocused == 3) centerHint = "[A] Select  |  [LB/RB] Tabs";
         int hintW = MeasureText(centerHint, 14);
-        DrawText(centerHint, screenWidth/2 - hintW/2, (int)(hintY + 28), 14, Fade(WHITE, 0.5f));
+        DrawText(centerHint, screenWidth/2 - hintW/2, (int)(hintY + 28), 14, Fade(g_theme.textDim, 0.6f));
         
         if (transAlpha > 0.01f) {
-            DrawRectangle(0, 110, screenWidth, screenHeight - 110, Fade({12, 12, 15, 255}, transAlpha));
+            DrawRectangle(0, 110, screenWidth, screenHeight - 180, Fade(g_theme.primary, transAlpha));
         }
+        
+        // Notifications (always on top)
+        UpdateAndDrawNotifications(screenWidth, deltaTime);
         
         EndDrawing();
     }
 
-    // Cleanup
+    // ================================================================
+    // CLEANUP
+    // ================================================================
+    
+    DebugLog("Cleaning up...");
+    
     if (bgTexture.id > 0) UnloadTexture(bgTexture);
     if (isAnimatedBG && bgAnimImg.data) UnloadImage(bgAnimImg);
     for (auto& app : mediaApps) {
@@ -2381,7 +2959,11 @@ int main(int argc, char* argv[]) {
     for (auto& game : library) {
         if (game.hasPoster) UnloadTexture(game.poster);
     }
+    if (userProfile.hasAvatar && userProfile.avatar.id > 0) {
+        UnloadTexture(userProfile.avatar);
+    }
     
+    CleanupAudioSystem();
     CloseWindow();
     StopInputMonitoring();
 
@@ -2403,5 +2985,5 @@ int main(int argc, char* argv[]) {
 }
 
 // ============================================================================
-// END OF Q-SHELL v2.5
+// END OF Q-SHELL v2.6
 // ============================================================================
